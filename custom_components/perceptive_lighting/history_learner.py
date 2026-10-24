@@ -15,7 +15,7 @@ import math
 from typing import Any
 
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.sun import get_astral_Event_date, get_astral_location
+from homeassistant.helpers.sun import get_astral_location
 
 from .engine import SensorLearnedProfile, clamp
 
