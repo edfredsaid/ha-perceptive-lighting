@@ -5,7 +5,7 @@ from typing import Final
 
 DOMAIN: Final = "perceptive_lighting"
 NAME: Final = "Perceptive Lighting"
-VERSION: Final = "1.0.1"
+VERSION: Final = "1.1.0"
 
 # Static frontend URL for bundled custom Lovelace cards
 STATIC_URL_PATH: Final = "/perceptive_lighting_static"
@@ -217,7 +217,7 @@ DEFAULT_ON_OFF_COOLDOWN_MINUTES: Final = 10
 DEFAULT_ADJUST_INTERVAL_MINUTES: Final = 5
 DEFAULT_TRANSITION_SECONDS: Final = 20
 DEFAULT_SUBSTANTIAL_LUX_SHIFT_PCT: Final = 32.0
-DEFAULT_MICRO_NUDGE_STEP_PCT: Final = 2.0
+DEFAULT_MICRO_NUDGE_STEP_PCT: Final = 8.0
 
 # Services / Actions
 SERVICE_APPLY_ADAPTIVE_SCENE: Final = "apply_adaptive_scene"
@@ -227,6 +227,7 @@ SERVICE_LOCK_ROOM: Final = "lock_room"
 SERVICE_UNLOCK_ROOM: Final = "unlock_room"
 SERVICE_NUDGE_FEEL: Final = "nudge_feel"
 SERVICE_CALIBRATE_FEELS_DARK_NOW: Final = "calibrate_feels_dark_now"
+SERVICE_CALIBRATE_FEELS_BRIGHT_NOW: Final = "calibrate_feels_bright_now"
 SERVICE_SET_WINDOW_COMPASS: Final = "set_window_compass"
 SERVICE_UPDATE_ROOM_EXCLUSIONS: Final = "update_room_exclusions"
 SERVICE_RELEARN_HISTORY: Final = "relearn_history"

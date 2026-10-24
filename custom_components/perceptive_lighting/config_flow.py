@@ -98,6 +98,22 @@ def _discover_area_candidates(
         elif dom == "media_player":
             media.append(eid)
         elif dom == "light":
+            fname = (
+                entry.name
+                or entry.original_name
+                or (st.attributes.get("friendly_name", "") if st else "")
+                or ""
+            ).lower()
+            eid_low = eid.lower()
+            # Automatically filter out gradient segments and tiny sensor status LEDs
+            if (
+                "segment" in eid_low
+                or "segment" in fname
+                or eid_low.endswith("_status_led")
+                or eid_low.endswith("_mmwave_led")
+                or eid_low.endswith("_indicator_led")
+            ):
+                continue
             lights.append(eid)
         elif dom == "scene":
             scenes.append(eid)

@@ -304,6 +304,21 @@ class RoomController:
             elif domain == "media_player":
                 media_list.append(eid)
             elif domain == "light":
+                fname = (
+                    entry.name
+                    or entry.original_name
+                    or (state_obj.attributes.get("friendly_name", "") if state_obj else "")
+                    or ""
+                ).lower()
+                eid_low = eid.lower()
+                if (
+                    "segment" in eid_low
+                    or "segment" in fname
+                    or eid_low.endswith("_status_led")
+                    or eid_low.endswith("_mmwave_led")
+                    or eid_low.endswith("_indicator_led")
+                ):
+                    continue
                 light_list.append(eid)
 
         self.all_area_entities = {
@@ -555,8 +570,8 @@ class RoomController:
 
         if not self.controlled_lights_are_on:
             # Lights are currently OFF
-            if wants_lights_on or force_apply:
-                # Check 10-minute on/off lockout (unless presence just entered the room or user forced scene)
+            if wants_lights_on or (force_apply and not wants_lights_off):
+                # Check 10-minute on/off lockout (unless presence just entered the room or user forced calibration/scene)
                 if (
                     not occupancy_just_changed
                     and not force_apply
@@ -564,21 +579,21 @@ class RoomController:
                 ):
                     return
                 await self._async_apply_active_scene_or_groups(
-                    rec_bri, rec_cct, transition=3 if occupancy_just_changed else 15
+                    max(15, rec_bri), rec_cct, transition=2 if (occupancy_just_changed or force_apply) else 15
                 )
                 self.last_on_off_change_utc = now
                 self.last_adjustment_utc = now
         else:
             # Lights are currently ON while room is occupied
-            if wants_lights_off and not force_apply:
-                # Only turn lights off while occupied if 10-minute cooldown has passed
-                if self.cooldown_active:
+            if wants_lights_off:
+                # Only turn lights off while occupied if 10-minute cooldown has passed OR user is actively calibrating (force_apply)
+                if self.cooldown_active and not force_apply:
                     return
-                await self._async_turn_off_room_lights(transition=25)
+                await self._async_turn_off_room_lights(transition=3 if force_apply else 20)
                 self.last_on_off_change_utc = now
                 return
 
-            # Lights stay ON -> Check 5-minute gradual adjustment interval
+            # Lights stay ON -> Check 5-minute gradual adjustment interval (bypassed during active calibration/force_apply)
             adjust_mins = float(
                 self.config.get(
                     CONF_ADJUST_INTERVAL_MINUTES, DEFAULT_ADJUST_INTERVAL_MINUTES
@@ -921,25 +936,58 @@ class RoomController:
         )
         return spec
 
-    async def async_nudge_feel(self, direction: str, step_pct: float = DEFAULT_MICRO_NUDGE_STEP_PCT) -> None:
-        """Nudge the room's perceptual target slightly lighter (+more light) or darker (-too bright)."""
-        delta = abs(step_pct) if direction in ("lighter", "more_light", "darker_room", "up", "+") else -abs(step_pct)
+    async def async_nudge_feel(
+        self, direction: str, step_pct: float = DEFAULT_MICRO_NUDGE_STEP_PCT
+    ) -> None:
+        """Nudge the room's perceptual target lighter (+more light) or darker (-too bright) and immediately apply."""
+        delta = (
+            abs(step_pct)
+            if direction in ("lighter", "more_light", "darker_room", "up", "+")
+            else -abs(step_pct)
+        )
         if self.hub.outdoor_state.is_daytime:
-            self.feel_nudge_day_pct = clamp(self.feel_nudge_day_pct + delta, -50.0, 50.0)
+            self.feel_nudge_day_pct = clamp(
+                self.feel_nudge_day_pct + delta, -120.0, 120.0
+            )
         else:
-            self.feel_nudge_night_pct = clamp(self.feel_nudge_night_pct + delta, -50.0, 50.0)
+            self.feel_nudge_night_pct = clamp(
+                self.feel_nudge_night_pct + delta, -120.0, 120.0
+            )
 
-        self.async_evaluate_room(self.hub.outdoor_state, trigger_control=True)
+        # Active calibration bypasses manual override and 10-minute anti-flicker cooldown!
+        self.manual_override_active = False
+        self.manual_override_baseline_natural_pct = None
+        self.last_on_off_change_utc = None
+        self.last_adjustment_utc = None
+
+        self.async_evaluate_room(self.hub.outdoor_state, trigger_control=False)
+        await self._async_run_lighting_controller(force_apply=True)
         await self.hub.async_save_runtime_state()
 
     async def async_calibrate_feels_dark_now(self) -> None:
-        """One-tap teaching calibration: adjust target so current natural lux registers as needing light."""
-        # Boost target so natural perceptive illuminance drops to ~58% (Dim / needing light)
-        if self.result.natural_perceptive_illuminance_pct > 58.0:
-            needed_steps = (self.result.natural_perceptive_illuminance_pct - 55.0) * 0.65
-            await self.async_nudge_feel("more_light", step_pct=clamp(needed_steps, 4.0, 24.0))
+        """One-tap teaching calibration: adjust target so current natural lux registers as dark/needing light and turns lights ON."""
+        # Calculate exact nudge needed so target_comfort_lux is at least 2.5x natural_spatial_lux
+        nat_lux = max(1.0, self.result.natural_spatial_lux)
+        desired_target = max(self.result.target_comfort_lux * 1.45, nat_lux * 2.5, 35.0)
+        ratio = desired_target / max(1.0, self.result.target_comfort_lux)
+        needed_step = max(10.0, 32.0 * math.log2(max(1.15, ratio)))
+        await self.async_nudge_feel("more_light", step_pct=clamp(needed_step, 10.0, 64.0))
+
+    async def async_calibrate_feels_bright_now(self) -> None:
+        """One-tap teaching calibration: room feels bright enough without lights right now -> lower target and turn lights OFF."""
+        # Lower target_comfort_lux below natural_spatial_lux so deficit drops to 0% and lights turn OFF immediately
+        nat_lux = max(2.0, self.result.natural_spatial_lux)
+        desired_target = max(2.0, nat_lux * 0.65)
+        ratio = desired_target / max(2.0, self.result.target_comfort_lux)
+        if ratio < 1.0:
+            needed_step = max(12.0, abs(32.0 * math.log2(max(0.05, ratio))))
         else:
-            await self.async_nudge_feel("more_light", step_pct=4.0)
+            needed_step = 16.0
+        await self.async_nudge_feel("too_bright", step_pct=clamp(needed_step, 12.0, 96.0))
+        # Ensure room lights turn off immediately when user says it's bright enough now
+        if self.controlled_lights_are_on:
+            await self._async_turn_off_room_lights(transition=3)
+            self.controlled_lights_are_on = False
 
     async def async_set_automation_lock(self, locked: bool) -> None:
         """Hard lock or unlock all room lighting and presence automation."""

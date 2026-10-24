@@ -25,6 +25,7 @@ async def async_setup_entry(
                 RoomNudgeNeedsMoreLightButton(room),
                 RoomNudgeTooBrightButton(room),
                 RoomCalibrateFeelsDarkNowButton(room),
+                RoomCalibrateFeelsBrightNowButton(room),
             ]
         )
     async_add_entities(entities)
@@ -51,7 +52,7 @@ class BaseRoomButton(ButtonEntity):
 
 
 class RoomNudgeNeedsMoreLightButton(BaseRoomButton):
-    """Micro-step button: Nudge room to feel like it needs slightly more light (+2%)."""
+    """Step button: Nudge room to feel like it needs more light (+8%)."""
 
     def __init__(self, room: RoomController) -> None:
         super().__init__(
@@ -66,7 +67,7 @@ class RoomNudgeNeedsMoreLightButton(BaseRoomButton):
 
 
 class RoomNudgeTooBrightButton(BaseRoomButton):
-    """Micro-step button: Nudge room to feel like it is slightly too bright (-2%)."""
+    """Step button: Nudge room to feel like it is too bright (-8%)."""
 
     def __init__(self, room: RoomController) -> None:
         super().__init__(
@@ -81,15 +82,30 @@ class RoomNudgeTooBrightButton(BaseRoomButton):
 
 
 class RoomCalibrateFeelsDarkNowButton(BaseRoomButton):
-    """One-tap teaching button: Calibrate room so current ambient level registers as dark."""
+    """One-tap teaching button: Calibrate room so current ambient level registers as dark and turns lights ON."""
 
     def __init__(self, room: RoomController) -> None:
         super().__init__(
             room,
             "calibrate_feels_dark_now",
-            "Calibrate: Feels Dark Now",
-            "mdi:auto-fix",
+            "Calibrate: Feels Dark Now (Turn On)",
+            "mdi:lightbulb-on-outline",
         )
 
     async def async_press(self) -> None:
         await self.room.async_calibrate_feels_dark_now()
+
+
+class RoomCalibrateFeelsBrightNowButton(BaseRoomButton):
+    """One-tap teaching button: Calibrate room so current ambient level registers as bright enough and turns lights OFF."""
+
+    def __init__(self, room: RoomController) -> None:
+        super().__init__(
+            room,
+            "calibrate_feels_bright_now",
+            "Calibrate: Feels Bright Enough Now (Turn Off)",
+            "mdi:lightbulb-off-outline",
+        )
+
+    async def async_press(self) -> None:
+        await self.room.async_calibrate_feels_bright_now()

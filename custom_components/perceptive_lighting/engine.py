@@ -358,8 +358,12 @@ def compute_room_perceptive_illuminance(
 
     effective_spatial_lux = max(0.0, base_spatial_lux * diffuse_modifier)
 
-    # Subtract artificial light contribution (only applying diffuse modifier to natural component)
-    natural_raw_est = max(0.0, base_spatial_lux - max(0.0, artificial_lux_estimate))
+    # Subtract artificial light contribution (capped proportionally so natural lux doesn't zero out unrealistically)
+    effective_art_lux = min(
+        max(0.0, artificial_lux_estimate),
+        base_spatial_lux * 0.78,
+    )
+    natural_raw_est = max(0.0, base_spatial_lux - effective_art_lux)
     natural_spatial_lux = max(0.0, natural_raw_est * diffuse_modifier)
 
     # 3. Dynamic Comfort Target (E_target)
@@ -384,15 +388,15 @@ def compute_room_perceptive_illuminance(
         if direct_sun:
             adaptation_offset *= 1.15
 
-    # Apply contextual micro-step nudges (weighted between day and night)
+    # Apply contextual feel nudges (weighted between day and night)
+    # Each 8% step shifts target_comfort_lux by ~20% (2^(nudge / 32)), allowing full range down to 2 lx!
     active_nudge_pct = (
         feel_nudge_day_pct if outdoor.is_daytime else feel_nudge_night_pct
     )
-    # Positive nudge = user clicked "+ Needs More Light" -> raises target lux
-    nudge_multiplier = math.pow(1.035, active_nudge_pct / 2.0)
+    nudge_multiplier = math.pow(2.0, active_nudge_pct / 32.0)
 
     target_comfort_lux = max(
-        10.0,
+        2.0,
         (base_target * outdoor.circadian_factor + adaptation_offset) * nudge_multiplier,
     )
 

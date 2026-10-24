@@ -577,9 +577,10 @@ class PerceptiveRoomCard extends HTMLElement {
             ? `
           <div class="tune-row">
             <div class="nudge-group">
-              <button class="btn-action" id="btn-nudge-darker" title="Nudge room target slightly lower (-2%)">🔉 Too Bright</button>
-              <button class="btn-action" id="btn-nudge-lighter" title="Nudge room target slightly higher (+2%)">🔆 Needs More Light</button>
-              <button class="btn-action" id="btn-feels-dark-now" title="One-tap teach: It feels dark right now">✨ Feels Dark Now</button>
+              <button class="btn-action" id="btn-nudge-darker" title="Nudge room target lower (-20% target lux)">🔉 Too Bright (-)</button>
+              <button class="btn-action" id="btn-nudge-lighter" title="Nudge room target higher (+20% target lux)">🔆 Needs More Light (+)</button>
+              <button class="btn-action" id="btn-feels-dark-now" title="One-tap teach: It feels dark right now (turn lights ON)">🌑 Feels Dark Now</button>
+              <button class="btn-action" id="btn-feels-bright-now" title="One-tap teach: It feels bright enough right now (turn lights OFF)">☀️ Bright Enough Now</button>
             </div>
             <button class="btn-action" id="btn-toggle-capture">📸 Capture Scene</button>
           </div>
@@ -646,6 +647,13 @@ class PerceptiveRoomCard extends HTMLElement {
     if (btnDarkNow) {
       btnDarkNow.addEventListener("click", () => {
         this._callService("calibrate_feels_dark_now", { room_id: roomId });
+      });
+    }
+
+    const btnBrightNow = this.shadowRoot.querySelector("#btn-feels-bright-now");
+    if (btnBrightNow) {
+      btnBrightNow.addEventListener("click", () => {
+        this._callService("calibrate_feels_bright_now", { room_id: roomId });
       });
     }
 

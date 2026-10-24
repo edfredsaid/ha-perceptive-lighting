@@ -18,6 +18,7 @@ from .const import (
     CONF_ROOMS,
     DOMAIN,
     SERVICE_APPLY_ADAPTIVE_SCENE,
+    SERVICE_CALIBRATE_FEELS_BRIGHT_NOW,
     SERVICE_CALIBRATE_FEELS_DARK_NOW,
     SERVICE_CAPTURE_ADAPTIVE_SCENE,
     SERVICE_DELETE_ADAPTIVE_SCENE,
@@ -84,7 +85,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_register_frontend_cards(hass: HomeAssistant) -> None:
-    """Serve and auto-register the bundled Custom Lovelace Cards."""
+    """Serve and auto-register the bundled Custom Lovelace Cards in both frontend and Lovelace storage."""
     if hass.data[DOMAIN].get("_frontend_registered"):
         return
 
@@ -95,6 +96,8 @@ async def _async_register_frontend_cards(hass: HomeAssistant) -> None:
         return
 
     url_path = f"{STATIC_URL_PATH}/{CARD_JS_FILENAME}"
+    versioned_url = f"{url_path}?v={VERSION}"
+
     try:
         await hass.http.async_register_static_paths(
             [StaticPathConfig(STATIC_URL_PATH, str(frontend_dir), cache_headers=False)]
@@ -107,9 +110,36 @@ async def _async_register_frontend_cards(hass: HomeAssistant) -> None:
         # Path already registered
         pass
 
-    add_extra_js_url(hass, f"{url_path}?v={VERSION}")
+    add_extra_js_url(hass, versioned_url)
+
+    # Also register in Lovelace ResourceStorageCollection so the visual Card Picker always loads it as an ES module
+    try:
+        lovelace = hass.data.get("lovelace")
+        resources = getattr(lovelace, "resources", None)
+        if resources is None and isinstance(lovelace, dict):
+            resources = lovelace.get("resources")
+        if resources is not None:
+            if not getattr(resources, "loaded", True):
+                await resources.async_load()
+            existing_items = list(resources.async_items() or [])
+            matched = None
+            for item in existing_items:
+                if STATIC_URL_PATH in item.get("url", ""):
+                    matched = item
+                    break
+            if matched is None:
+                await resources.async_create_item(
+                    {"res_type": "module", "url": versioned_url}
+                )
+            elif matched.get("url") != versioned_url:
+                await resources.async_update_item(
+                    matched["id"], {"res_type": "module", "url": versioned_url}
+                )
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.debug("Could not auto-register in Lovelace resources storage: %s", err)
+
     hass.data[DOMAIN]["_frontend_registered"] = True
-    _LOGGER.info("Registered Perceptive Lighting custom Lovelace cards at %s", url_path)
+    _LOGGER.info("Registered Perceptive Lighting custom Lovelace cards at %s", versioned_url)
 
 
 def _find_room(hass: HomeAssistant, room_key: str) -> RoomController | None:
@@ -170,13 +200,18 @@ def _async_register_services(hass: HomeAssistant) -> None:
         if room:
             await room.async_nudge_feel(
                 direction=call.data.get("direction", "more_light"),
-                step_pct=float(call.data.get("step_pct", 2.0)),
+                step_pct=float(call.data.get("step_pct", 8.0)),
             )
 
     async def handle_calibrate_feels_dark_now(call: ServiceCall) -> None:
         room = _find_room(hass, call.data["room_id"])
         if room:
             await room.async_calibrate_feels_dark_now()
+
+    async def handle_calibrate_feels_bright_now(call: ServiceCall) -> None:
+        room = _find_room(hass, call.data["room_id"])
+        if room:
+            await room.async_calibrate_feels_bright_now()
 
     async def handle_set_window_compass(call: ServiceCall) -> None:
         room = _find_room(hass, call.data["room_id"])
@@ -261,7 +296,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
             {
                 vol.Required("room_id"): str,
                 vol.Required("direction"): str,
-                vol.Optional("step_pct", default=2.0): vol.Coerce(float),
+                vol.Optional("step_pct", default=8.0): vol.Coerce(float),
             }
         ),
     )
@@ -269,6 +304,12 @@ def _async_register_services(hass: HomeAssistant) -> None:
         DOMAIN,
         SERVICE_CALIBRATE_FEELS_DARK_NOW,
         handle_calibrate_feels_dark_now,
+        schema=vol.Schema({vol.Required("room_id"): str}),
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CALIBRATE_FEELS_BRIGHT_NOW,
+        handle_calibrate_feels_bright_now,
         schema=vol.Schema({vol.Required("room_id"): str}),
     )
     hass.services.async_register(

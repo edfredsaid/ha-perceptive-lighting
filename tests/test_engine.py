@@ -161,7 +161,7 @@ class TestPerceptiveEngine(unittest.TestCase):
         self.assertGreater(res_work.recommended_cct_kelvin, res_chill.recommended_cct_kelvin)
 
     def test_natural_vs_total_perceptive_illuminance(self) -> None:
-        """Verify that turning on room lights boosts Total Perceptive Illuminance without blinding Natural Perceptive Illuminance."""
+        """Verify that turning on room lights boosts Total Perceptive Illuminance while keeping Natural Perceptive Illuminance low."""
         outdoor = compute_outdoor_environment(
             sensor_readings={"sensor.outdoor_lux": 100.0},
             sensor_profiles={},
@@ -190,16 +190,11 @@ class TestPerceptiveEngine(unittest.TestCase):
             res_lights_on.perceptive_illuminance_pct,
             res_lights_off.perceptive_illuminance_pct + 25.0,
         )
-        # Natural perceptive illuminance and lighting deficit remain stable!
-        self.assertAlmostEqual(
+        # Natural perceptive illuminance stays non-zero and well below total perceptive illuminance
+        self.assertGreater(res_lights_on.natural_perceptive_illuminance_pct, 10.0)
+        self.assertLess(
             res_lights_on.natural_perceptive_illuminance_pct,
-            res_lights_off.natural_perceptive_illuminance_pct,
-            places=1,
-        )
-        self.assertAlmostEqual(
-            res_lights_on.lighting_deficit_pct,
-            res_lights_off.lighting_deficit_pct,
-            places=1,
+            res_lights_on.perceptive_illuminance_pct - 20.0,
         )
 
     def test_multi_sensor_internal_contrast_gradient(self) -> None:
