@@ -756,19 +756,25 @@ class RoomController:
             return self.manual_scene_override_id, True, f"Manual Selection ({label})"
 
         # 2. Check Per-Time-of-Day Scene Triggers (`scene_triggers`)
-        #    Check regime-specific triggers first, then "any" regime triggers
+        #    Check regime-specific triggers first, then "any" regime triggers;
+        #    within each, check specific entity triggers before presence_only rules.
         ordered_triggers = [
             t for t in self.scene_triggers if t.get("regime") == regime
         ] + [
             t for t in self.scene_triggers if t.get("regime") in ("any", None, "")
         ]
-        for trig in ordered_triggers:
+        entity_triggers = [
+            t for t in ordered_triggers if t.get("entity_id") not in (None, "", "presence_only")
+        ]
+        presence_triggers = [
+            t for t in ordered_triggers if t.get("entity_id") in (None, "", "presence_only")
+        ]
+
+        for trig in entity_triggers:
             teid = trig.get("entity_id")
             target_states = [str(s).lower() for s in (trig.get("states") or ["on", "playing"])]
             target_scene = str(trig.get("scene_id") or "all_lights")
-            scale_dyn = bool(trig.get("scale_dynamically", True))
-            if not teid:
-                continue
+            scale_dyn = bool(trig.get("scale_dynamically", trig.get("dynamic_scaling", True)))
             st = self.hass.states.get(teid)
             if st and st.state.lower() in target_states:
                 fname = st.attributes.get("friendly_name", teid)
@@ -777,6 +783,18 @@ class RoomController:
                     scale_dyn,
                     f"Trigger ({fname} = {st.state})",
                 )
+
+        if self.is_occupied and presence_triggers:
+            trig = presence_triggers[0]
+            target_scene = str(trig.get("scene_id") or "all_lights")
+            scale_dyn = bool(trig.get("scale_dynamically", trig.get("dynamic_scaling", True)))
+            opts = self.get_available_scene_options()
+            s_label = opts.get(target_scene, target_scene)
+            return (
+                target_scene,
+                scale_dyn,
+                f"Presence Rule — {regime.title()} ({s_label})",
+            )
 
         # 3. Otherwise use the active Time-of-Day Regime's Default Occupied Scene
         rcfg = self.regime_configs.get(regime, DEFAULT_REGIME_SETTINGS.get(regime, {}))
@@ -2045,10 +2063,14 @@ class RoomController:
             self.async_discover_area_entities()
 
         if CONF_LIGHT_PRIORITY_ORDER in updates and isinstance(updates[CONF_LIGHT_PRIORITY_ORDER], list):
-            new_order = [str(e) for e in updates[CONF_LIGHT_PRIORITY_ORDER] if e in self.lights]
-            remaining = [e for e in self.lights if e not in new_order]
-            self.light_priority_order = new_order + remaining
             self.light_order_locked = bool(updates.get(CONF_LIGHT_ORDER_LOCKED, True))
+            if not self.light_order_locked or not updates[CONF_LIGHT_PRIORITY_ORDER]:
+                self.light_order_locked = False
+                self._rebuild_light_priority_order()
+            else:
+                new_order = [str(e) for e in updates[CONF_LIGHT_PRIORITY_ORDER] if e in self.lights]
+                remaining = [e for e in self.lights if e not in new_order]
+                self.light_priority_order = new_order + remaining
             self.config[CONF_LIGHT_PRIORITY_ORDER] = list(self.light_priority_order)
             self.config[CONF_LIGHT_ORDER_LOCKED] = self.light_order_locked
 
@@ -2071,7 +2093,6 @@ class RoomController:
                         self.regime_configs[rkey]["target_total_lux"] = round(clamp(float(rval["target_total_lux"]), 1.0, 300.0), 1)
                     if "shed_count" in rval:
                         self.regime_configs[rkey]["shed_count"] = int(max(0, int(rval["shed_count"])))
-                    # Allow updating competing models per regime too
                     spec = self.learned_weights.get_regime_spec(rkey)
                     if "illum_model" in rval:
                         spec.illum_model = str(rval["illum_model"])
@@ -2080,23 +2101,36 @@ class RoomController:
                     if "season_model" in rval:
                         spec.season_model = str(rval["season_model"])
 
+        if "regime_models" in updates and isinstance(updates["regime_models"], dict):
+            for rkey, mval in updates["regime_models"].items():
+                if rkey in TIME_REGIMES and isinstance(mval, dict):
+                    spec = self.learned_weights.get_regime_spec(rkey)
+                    if "illum_model" in mval:
+                        spec.illum_model = str(mval["illum_model"])
+                    if "weather_model" in mval:
+                        spec.weather_model = str(mval["weather_model"])
+                    if "season_model" in mval:
+                        spec.season_model = str(mval["season_model"])
+
         if CONF_SCENE_TRIGGERS in updates and isinstance(updates[CONF_SCENE_TRIGGERS], list):
             clean_trigs: list[dict[str, Any]] = []
             for idx, t in enumerate(updates[CONF_SCENE_TRIGGERS]):
-                if isinstance(t, dict) and t.get("entity_id"):
+                if isinstance(t, dict):
+                    teid = str(t.get("entity_id") or "presence_only").strip()
                     raw_states = t.get("states", ["on", "playing"])
                     if isinstance(raw_states, str):
                         states_list = [s.strip() for s in raw_states.split(",") if s.strip()]
                     else:
                         states_list = [str(s).strip() for s in raw_states if str(s).strip()]
+                    scale_dyn = bool(t.get("scale_dynamically", t.get("dynamic_scaling", True)))
                     clean_trigs.append(
                         {
                             "id": str(t.get("id") or f"trig_{idx}"),
                             "regime": str(t.get("regime") or "any"),
-                            "entity_id": str(t["entity_id"]).strip(),
-                            "states": states_list or ["on", "playing"],
+                            "entity_id": teid,
+                            "states": states_list if teid != "presence_only" else ["occupied"],
                             "scene_id": str(t.get("scene_id") or "all_lights"),
-                            "scale_dynamically": bool(t.get("scale_dynamically", True)),
+                            "scale_dynamically": scale_dyn,
                         }
                     )
             self.scene_triggers = clean_trigs
