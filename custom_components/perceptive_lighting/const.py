@@ -1,15 +1,21 @@
-"""Constants for the Perceptive Lighting integration."""
+"""Constants for the Perceptive Lighting integration (v2.0.0)."""
 from __future__ import annotations
 
 from typing import Final
 
 DOMAIN: Final = "perceptive_lighting"
 NAME: Final = "Perceptive Lighting"
-VERSION: Final = "1.3.1"
+VERSION: Final = "2.0.0"
 
-# Static frontend URL for bundled custom Lovelace cards
+# Static frontend URL for bundled custom Lovelace cards & Sidebar Panel
 STATIC_URL_PATH: Final = "/perceptive_lighting_static"
 CARD_JS_FILENAME: Final = "perceptive-lighting-cards.js"
+
+# Custom Sidebar Panel Registration
+SIDEBAR_PANEL_URL_PATH: Final = "perceptive-lighting"
+SIDEBAR_PANEL_TITLE: Final = "Perceptive Lighting"
+SIDEBAR_PANEL_ICON: Final = "mdi:lightbulb-auto-outline"
+SIDEBAR_PANEL_COMPONENT_NAME: Final = "perceptive-lighting-panel"
 
 # Hub / Global Configuration Keys
 CONF_WEATHER_ENTITY: Final = "weather_entity"
@@ -17,6 +23,7 @@ CONF_OUTDOOR_SENSORS: Final = "outdoor_sensors"
 CONF_SUN_ENTITY: Final = "sun_entity"
 CONF_OUTDOOR_SENSOR_PROFILES: Final = "outdoor_sensor_profiles"
 CONF_GLOBAL_LOCK: Final = "global_lock"
+CONF_REGIME_SCHEDULE: Final = "regime_schedule"
 
 # Room Configuration Keys (Subentries / Room Entries)
 CONF_ROOMS: Final = "rooms"
@@ -42,6 +49,12 @@ CONF_LIGHT_GROUPS: Final = "light_groups"
 CONF_ACTIVITY_TRIGGERS: Final = "activity_triggers"
 CONF_BLOCKER_ENTITIES: Final = "blocker_entities"
 
+# v2.0.0 Room Configuration Keys
+CONF_LIGHT_PRIORITY_ORDER: Final = "light_priority_order"
+CONF_LIGHT_ORDER_LOCKED: Final = "light_order_locked"
+CONF_REGIME_CONFIGS: Final = "regime_configs"
+CONF_SCENE_TRIGGERS: Final = "scene_triggers"
+
 # Operating Modes
 MODE_SENSOR_ONLY: Final = "sensor_only"
 MODE_SIMPLE_TRANSIT: Final = "simple_transit"
@@ -53,7 +66,7 @@ OPERATING_MODES: Final = {
     MODE_FULL_ADAPTIVE: "Full Adaptive Controller (Living / Dwelling / Multi-Use)",
 }
 
-# Room Activities (Multi-purpose room profiles)
+# Legacy Room Activities (kept for backward compatibility with existing scenes/configs)
 ACTIVITY_RELAXING: Final = "relaxing"
 ACTIVITY_WORKING: Final = "working"
 ACTIVITY_READING: Final = "reading"
@@ -66,38 +79,38 @@ ACTIVITY_DEFINITIONS: Final = {
     ACTIVITY_RELAXING: {
         "name": "Relaxing / Chilling",
         "icon": "mdi:sofa",
-        "base_lux": 65.0,
-        "adaptation_alpha": 45.0,
+        "base_lux": 12.0,
+        "adaptation_alpha": 4.0,
         "cave_contrast_weight": 0.85,
         "min_cct": 2200,
         "max_cct": 3200,
-        "brightness_scale": 0.75,
+        "brightness_scale": 0.70,
     },
     ACTIVITY_WORKING: {
         "name": "Working / Focus",
         "icon": "mdi:laptop",
-        "base_lux": 220.0,
-        "adaptation_alpha": 85.0,
-        "cave_contrast_weight": 1.25,
+        "base_lux": 18.0,
+        "adaptation_alpha": 6.0,
+        "cave_contrast_weight": 1.15,
         "min_cct": 3200,
         "max_cct": 4800,
-        "brightness_scale": 1.0,
+        "brightness_scale": 0.90,
     },
     ACTIVITY_READING: {
         "name": "Reading",
         "icon": "mdi:book-open-page-variant",
-        "base_lux": 140.0,
-        "adaptation_alpha": 60.0,
+        "base_lux": 15.0,
+        "adaptation_alpha": 5.0,
         "cave_contrast_weight": 1.0,
         "min_cct": 2600,
         "max_cct": 3800,
-        "brightness_scale": 0.88,
+        "brightness_scale": 0.80,
     },
     ACTIVITY_FILM: {
         "name": "Watching Film / Media",
         "icon": "mdi:movie-open",
-        "base_lux": 18.0,
-        "adaptation_alpha": 10.0,
+        "base_lux": 6.0,
+        "adaptation_alpha": 2.0,
         "cave_contrast_weight": 0.25,
         "min_cct": 2000,
         "max_cct": 2600,
@@ -106,31 +119,31 @@ ACTIVITY_DEFINITIONS: Final = {
     ACTIVITY_SLEEP_PREP: {
         "name": "Wind-Down / Bedtime",
         "icon": "mdi:weather-night",
-        "base_lux": 25.0,
-        "adaptation_alpha": 15.0,
+        "base_lux": 5.0,
+        "adaptation_alpha": 2.0,
         "cave_contrast_weight": 0.40,
         "min_cct": 2000,
         "max_cct": 2400,
-        "brightness_scale": 0.35,
+        "brightness_scale": 0.25,
     },
     ACTIVITY_TRANSIT: {
         "name": "Transit / Passing Through",
         "icon": "mdi:walk",
-        "base_lux": 50.0,
-        "adaptation_alpha": 35.0,
+        "base_lux": 10.0,
+        "adaptation_alpha": 3.0,
         "cave_contrast_weight": 0.75,
         "min_cct": 2400,
-        "max_cct": 4000,
-        "brightness_scale": 0.70,
+        "max_cct": 3600,
+        "brightness_scale": 0.65,
     },
     ACTIVITY_BRIGHT_TASK: {
         "name": "Bright Task / Assembly",
         "icon": "mdi:spotlight-beam",
-        "base_lux": 320.0,
-        "adaptation_alpha": 100.0,
-        "cave_contrast_weight": 1.35,
-        "min_cct": 3800,
-        "max_cct": 5200,
+        "base_lux": 22.0,
+        "adaptation_alpha": 8.0,
+        "cave_contrast_weight": 1.25,
+        "min_cct": 3500,
+        "max_cct": 5000,
         "brightness_scale": 1.0,
     },
 }
@@ -149,10 +162,10 @@ DAYLIGHT_LEVELS: Final = {
 }
 
 DAYLIGHT_ADAPTATION_MULTIPLIERS: Final = {
-    DAYLIGHT_NONE: 0.15,  # Minimal circadian expectation shift, no window contrast
+    DAYLIGHT_NONE: 0.15,
     DAYLIGHT_LOW: 0.65,
     DAYLIGHT_MEDIUM: 1.0,
-    DAYLIGHT_HIGH: 1.35,  # High simultaneous contrast near large glazing
+    DAYLIGHT_HIGH: 1.35,
 }
 
 # Direct Sun Window Timing
@@ -183,16 +196,16 @@ SENSOR_PLACEMENTS: Final = {
     PLACEMENT_AUTO: "Auto-Learn from Room & History",
     PLACEMENT_BALANCED: "Balanced / Middle of Room (1.0x)",
     PLACEMENT_NEAR_WINDOW: "Near or Facing Window (Dampens glare 0.65x)",
-    PLACEMENT_DIM_CORNER: "Tucked in Dim Corner / Shelf (Boosts reading 1.45x)",
-    PLACEMENT_CEILING: "Ceiling Mounted Downward (1.15x)",
+    PLACEMENT_DIM_CORNER: "Tucked in Dim Corner / Shelf (Boosts reading 1.35x)",
+    PLACEMENT_CEILING: "Ceiling Mounted Downward (1.10x)",
 }
 
 PLACEMENT_MULTIPLIERS: Final = {
     PLACEMENT_AUTO: 1.0,
     PLACEMENT_BALANCED: 1.0,
     PLACEMENT_NEAR_WINDOW: 0.65,
-    PLACEMENT_DIM_CORNER: 1.45,
-    PLACEMENT_CEILING: 1.15,
+    PLACEMENT_DIM_CORNER: 1.35,
+    PLACEMENT_CEILING: 1.10,
 }
 
 # CCT Control Modes
@@ -201,7 +214,7 @@ CCT_KRUITHOF: Final = "kruithof_circadian"
 CCT_BRIGHTNESS_ONLY: Final = "brightness_only"
 
 CCT_MODES: Final = {
-    CCT_EXTERNAL: "Compatible / External (Let Adaptive Lighting or Scenes handle CCT)",
+    CCT_EXTERNAL: "Compatible / External (Let Scenes or Adaptive Lighting handle CCT)",
     CCT_KRUITHOF: "Built-in Kruithof & Circadian CCT (Warmer when dim, crisp when bright)",
     CCT_BRIGHTNESS_ONLY: "Brightness & Switch Only (Never modify color/CCT)",
 }
@@ -215,9 +228,9 @@ STATE_BRIGHT: Final = "bright"
 # Default Anti-Flicker & Smoothing Constants
 DEFAULT_ON_OFF_COOLDOWN_MINUTES: Final = 10
 DEFAULT_ADJUST_INTERVAL_MINUTES: Final = 5
-DEFAULT_TRANSITION_SECONDS: Final = 20
-DEFAULT_SUBSTANTIAL_LUX_SHIFT_PCT: Final = 32.0
-DEFAULT_MICRO_NUDGE_STEP_PCT: Final = 8.0
+DEFAULT_TRANSITION_SECONDS: Final = 15
+DEFAULT_SUBSTANTIAL_LUX_SHIFT_PCT: Final = 35.0
+DEFAULT_MICRO_NUDGE_STEP_PCT: Final = 15.0
 
 # Services / Actions
 SERVICE_APPLY_ADAPTIVE_SCENE: Final = "apply_adaptive_scene"
@@ -232,6 +245,9 @@ SERVICE_SET_WINDOW_COMPASS: Final = "set_window_compass"
 SERVICE_UPDATE_ROOM_EXCLUSIONS: Final = "update_room_exclusions"
 SERVICE_RELEARN_HISTORY: Final = "relearn_history"
 SERVICE_OPTIMIZE_WITH_AI: Final = "optimize_with_ai"
+SERVICE_RESET_ROOM: Final = "reset_room"
+SERVICE_UPDATE_ROOM_CONFIG: Final = "update_room_config"
+SERVICE_UPDATE_HUB_CONFIG: Final = "update_hub_config"
 
 # 4 Distinct Time-of-Day Regimes
 REGIME_MORNING: Final = "morning"
@@ -246,7 +262,67 @@ TIME_REGIMES: Final = (
     REGIME_OVERNIGHT,
 )
 
-# Stage 1: Competing Base Illuminance & Retinal Adaptation Models (I1..I5)
+# Default Configurable Time-of-Day Regime Schedule & Factors
+DEFAULT_REGIME_SCHEDULE: Final = {
+    "mode": "hybrid",  # "hybrid" (Solar + Clock), "clock_only", "solar_only"
+    "morning_start_hour": 6.0,
+    "morning_solar_elev": -4.0,
+    "day_start_hour": 10.0,
+    "day_solar_elev": 14.0,
+    "evening_start_hour": 17.5,
+    "evening_solar_elev": 9.0,
+    "overnight_start_hour": 23.0,
+    "overnight_end_hour": 6.0,
+    "gloom_early_evening": True,
+    "gloom_sky_lux_threshold": 350.0,
+    "transition_minutes": 45,
+}
+
+# Default Per-Regime Room Settings (Grounded in Real Home Sensor Lux 1-25 lx!)
+DEFAULT_REGIME_SETTINGS: Final = {
+    REGIME_MORNING: {
+        "occupied_scene": "all_lights",
+        "off_scene": "off",
+        "off_scene_when_unoccupied": False,
+        "off_scene_when_bright": False,
+        "turn_on_lux": 10.0,
+        "target_brightness_pct": 60,
+        "target_total_lux": 14.0,
+        "shed_count": 0,
+    },
+    REGIME_DAY: {
+        "occupied_scene": "all_lights",
+        "off_scene": "off",
+        "off_scene_when_unoccupied": False,
+        "off_scene_when_bright": False,
+        "turn_on_lux": 12.0,
+        "target_brightness_pct": 70,
+        "target_total_lux": 16.0,
+        "shed_count": 0,
+    },
+    REGIME_EVENING: {
+        "occupied_scene": "all_lights",
+        "off_scene": "off",
+        "off_scene_when_unoccupied": False,
+        "off_scene_when_bright": False,
+        "turn_on_lux": 12.0,
+        "target_brightness_pct": 70,
+        "target_total_lux": 14.0,
+        "shed_count": 0,
+    },
+    REGIME_OVERNIGHT: {
+        "occupied_scene": "all_lights",
+        "off_scene": "off",
+        "off_scene_when_unoccupied": False,
+        "off_scene_when_bright": False,
+        "turn_on_lux": 3.0,
+        "target_brightness_pct": 15,
+        "target_total_lux": 5.0,
+        "shed_count": 0,
+    },
+}
+
+# Stage 1: Competing Base Illuminance & Dimming Curve Models (I1..I5)
 ILLUM_MODEL_WEBER_FECHNER: Final = "weber_fechner"
 ILLUM_MODEL_STEVENS_POWER: Final = "stevens_power"
 ILLUM_MODEL_NAKA_RUSHTON: Final = "naka_rushton"

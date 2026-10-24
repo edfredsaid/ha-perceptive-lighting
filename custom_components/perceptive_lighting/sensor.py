@@ -11,11 +11,22 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
+    CCT_EXTERNAL,
+    CONF_ADJUST_INTERVAL_MINUTES,
+    CONF_CCT_MODE,
+    CONF_DAYLIGHT_LEVEL,
+    CONF_ON_OFF_COOLDOWN_MINUTES,
+    CONF_TRANSITION_SECONDS,
+    DAYLIGHT_MEDIUM,
+    DEFAULT_ADJUST_INTERVAL_MINUTES,
+    DEFAULT_ON_OFF_COOLDOWN_MINUTES,
+    DEFAULT_TRANSITION_SECONDS,
     DOMAIN,
     NAME,
     STATE_BRIGHT,
@@ -58,7 +69,7 @@ async def async_setup_entry(
 
 
 class OutdoorEffectiveSkyLuxSensor(SensorEntity):
-    """Global hub sensor reporting unified outdoor effective sky illuminance & adaptation data."""
+    """Global hub sensor reporting unified outdoor effective sky illuminance, time-of-day regime blend, and hub settings."""
 
     _attr_has_entity_name = True
     _attr_name = "Outdoor Effective Sky Illuminance"
@@ -98,8 +109,13 @@ class OutdoorEffectiveSkyLuxSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return rich outdoor adaptation attributes for diagnostics and Lovelace cards."""
+        """Return rich outdoor adaptation attributes and hub configuration for Sidebar UI and Lovelace cards."""
         st = self.hub.outdoor_state
+        area_reg = ar.async_get(self.hass)
+        all_areas = [
+            {"area_id": a.id, "name": a.name}
+            for a in sorted(area_reg.async_list_areas(), key=lambda x: x.name.lower())
+        ]
         return {
             "raw_outdoor_lux": st.raw_outdoor_lux,
             "is_synthetic_lux": st.is_synthetic_lux,
@@ -114,10 +130,17 @@ class OutdoorEffectiveSkyLuxSensor(SensorEntity):
             "outdoor_temp_c": st.outdoor_temp_c,
             "day_length_hours": st.day_length_hours,
             "time_regime": st.time_regime,
+            "regime_weights": st.regime_weights,
+            "regime_explanation": st.regime_explanation,
+            "regime_schedule": dict(self.hub.regime_schedule),
+            "weather_entity": self.hub.weather_entity,
+            "outdoor_sensors": list(self.hub.outdoor_sensors),
+            "global_lock": self.hub.global_lock,
             "outdoor_sensor_profiles": {
                 k: v.to_dict() for k, v in self.hub.outdoor_profiles.items()
             },
             "configured_rooms": list(self.hub.rooms.keys()),
+            "all_ha_areas": all_areas,
         }
 
 
@@ -171,14 +194,32 @@ class RoomPerceptiveIlluminanceSensor(BaseRoomSensor):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Expose complete room diagnostic & UI card state attributes."""
+        """Expose complete room diagnostic, live reason, shedding priority, regime scenes, triggers, and UI state."""
         res = self.room.result
         return {
             "room_id": self.room.room_id,
             "room_name": self.room.room_name,
             "area_id": self.room.area_id,
             "operating_mode": self.room.operating_mode,
+            "daylight_level": self.room.config.get(CONF_DAYLIGHT_LEVEL, DAYLIGHT_MEDIUM),
+            "cct_mode": self.room.config.get(CONF_CCT_MODE, CCT_EXTERNAL),
+            "on_off_cooldown_minutes": float(
+                self.room.config.get(
+                    CONF_ON_OFF_COOLDOWN_MINUTES, DEFAULT_ON_OFF_COOLDOWN_MINUTES
+                )
+            ),
+            "adjust_interval_minutes": float(
+                self.room.config.get(
+                    CONF_ADJUST_INTERVAL_MINUTES, DEFAULT_ADJUST_INTERVAL_MINUTES
+                )
+            ),
+            "transition_seconds": float(
+                self.room.config.get(
+                    CONF_TRANSITION_SECONDS, DEFAULT_TRANSITION_SECONDS
+                )
+            ),
             "time_regime": res.time_regime,
+            "regime_weights": res.regime_weights,
             "active_illum_model": res.active_illum_model,
             "active_weather_model": res.active_weather_model,
             "active_season_model": res.active_season_model,
@@ -192,6 +233,8 @@ class RoomPerceptiveIlluminanceSensor(BaseRoomSensor):
             "artificial_lux_contribution": res.artificial_lux_contribution,
             "min_artificial_lux": res.min_artificial_lux,
             "target_comfort_lux": res.target_comfort_lux,
+            "turn_on_lux_threshold": res.turn_on_lux_threshold,
+            "turn_off_lux_threshold": res.turn_off_lux_threshold,
             "natural_perceptive_illuminance_pct": res.natural_perceptive_illuminance_pct,
             "lighting_deficit_pct": res.lighting_deficit_pct,
             "perceptive_state": res.perceptive_state,
@@ -202,11 +245,23 @@ class RoomPerceptiveIlluminanceSensor(BaseRoomSensor):
             "internal_contrast_ratio": res.internal_contrast_ratio,
             "outdoor_adaptation_offset_lux": res.outdoor_adaptation_offset_lux,
             "recommended_brightness_pct": res.recommended_brightness_pct,
+            "recommended_shed_count": res.recommended_shed_count,
+            "active_shed_count": self.room.active_shed_count,
+            "shed_light_entities": self.room.shed_light_entities,
             "recommended_cct_kelvin": res.recommended_cct_kelvin,
             "active_activity": self.room.active_activity,
             "active_scene_id": self.room.active_scene_id,
+            "resolved_scene_id": self.room.resolved_scene_id,
+            "resolved_scene_reason": self.room.resolved_scene_reason,
+            "decision_reason": self.room.decision_reason,
             "available_scenes": self.room.get_available_scene_options(),
+            "regime_configs": self.room.regime_configs,
+            "scene_triggers": self.room.scene_triggers,
+            "light_priority_order": self.room.light_priority_order,
+            "light_order_locked": self.room.light_order_locked,
+            "light_metadata": self.room.light_metadata,
             "is_occupied": self.room.is_occupied,
+            "occupied_by_entities": self.room.occupied_by_entities,
             "automation_locked": self.room.automation_locked,
             "manual_override_active": self.room.manual_override_active,
             "cooldown_active": self.room.cooldown_active,
@@ -220,6 +275,7 @@ class RoomPerceptiveIlluminanceSensor(BaseRoomSensor):
             "included_media_players": self.room.media_players,
             "included_lights": self.room.lights,
             "excluded_entities": list(self.room.excluded_entities),
+            "auto_excluded_helpers": self.room.auto_excluded_helpers,
             "all_area_entities": self.room.all_area_entities,
             "sensor_breakdown": res.sensor_breakdown,
             "sensor_dynamic_weights": res.sensor_dynamic_weights,
@@ -258,6 +314,8 @@ class RoomNaturalPerceptiveIlluminanceSensor(BaseRoomSensor):
         return {
             "natural_spatial_lux": res.natural_spatial_lux,
             "target_comfort_lux": res.target_comfort_lux,
+            "turn_on_lux_threshold": res.turn_on_lux_threshold,
+            "turn_off_lux_threshold": res.turn_off_lux_threshold,
             "outdoor_adaptation_offset_lux": res.outdoor_adaptation_offset_lux,
             "diffuse_modifier": res.diffuse_modifier,
             "direct_sun_in_window": res.direct_sun_in_window,
@@ -283,8 +341,10 @@ class RoomLightingDeficitSensor(BaseRoomSensor):
         res = self.room.result
         return {
             "recommended_brightness_pct": res.recommended_brightness_pct,
+            "recommended_shed_count": res.recommended_shed_count,
             "recommended_cct_kelvin": res.recommended_cct_kelvin,
             "active_activity": self.room.active_activity,
+            "resolved_scene_id": self.room.resolved_scene_id,
         }
 
 

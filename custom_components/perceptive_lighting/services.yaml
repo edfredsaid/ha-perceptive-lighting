@@ -1,6 +1,6 @@
 apply_adaptive_scene:
   name: Apply Adaptive Scene or Activity
-  description: Activate an Adaptive Scene or Activity in a room with brightness dynamically scaled to the current Perceptive Lighting Deficit.
+  description: Activate an Adaptive Scene, Home Assistant Scene, or Activity in a room with brightness dynamically scaled to the current Perceptive Lighting Deficit.
   fields:
     room_id:
       name: Room ID or Name
@@ -11,7 +11,7 @@ apply_adaptive_scene:
         text:
     scene:
       name: Scene or Activity
-      description: The Adaptive Scene ID, friendly name (e.g., Chilling, Working, Film), or 'default'.
+      description: The Adaptive Scene ID, HA Scene entity ID, friendly name (e.g., Chilling, Working, Film), or 'default'.
       required: true
       example: "activity_working"
       selector:
@@ -87,8 +87,8 @@ unlock_room:
         text:
 
 nudge_feel:
-  name: Micro-Nudge Room Perceptual Feel
-  description: Nudge a room's perceptual target slightly lighter (+2% Needs More Light) or darker (-2% Too Bright) for the current time of day.
+  name: Direct Brightness & Shedding Control (+ / -)
+  description: Directly step room brightness up (+) or down (-) to 1% and then progressively shed one light source at a time, recording the resulting measured room lux after 5 seconds.
   fields:
     room_id:
       name: Room ID or Name
@@ -108,7 +108,7 @@ nudge_feel:
     step_pct:
       name: Step Size (%)
       required: false
-      default: 8.0
+      default: 10.0
       selector:
         number:
           min: 1.0
@@ -117,7 +117,7 @@ nudge_feel:
 
 calibrate_feels_dark_now:
   name: "Calibrate: Room Feels Dark Now (Turn On)"
-  description: One-tap teaching action that calibrates the room's perceptual target so current natural lighting conditions trigger supplemental light and turns lights ON immediately.
+  description: One-tap teaching action that calibrates the room's turn-on lux threshold so current ambient lighting triggers supplemental light and turns lights ON immediately.
   fields:
     room_id:
       name: Room ID or Name
@@ -128,7 +128,7 @@ calibrate_feels_dark_now:
 
 calibrate_feels_bright_now:
   name: "Calibrate: Room Feels Bright Enough Now (Turn Off)"
-  description: One-tap teaching action that calibrates the room's perceptual target so current natural lighting conditions feel bright enough without supplemental light and turns lights OFF immediately.
+  description: One-tap teaching action that calibrates the room's turn-on lux threshold so current natural lighting feels bright enough without supplemental light and turns lights OFF immediately.
   fields:
     room_id:
       name: Room ID or Name
@@ -179,8 +179,8 @@ relearn_history:
   description: Re-analyze the past 10 days of Home Assistant Recorder history for all outdoor and indoor illuminance sensors.
 
 optimize_with_ai:
-  name: "AI: Optimize Room Perceptual Model (Gemini / HA AI)"
-  description: Analyze recorded user manual adjustments, calibration presses, and weather/sun telemetry using Home Assistant's AI Task / Gemini integration (with local ML fallback) to refine multi-dimensional room perceptual weights.
+  name: "AI: Optimize Room Perceptual Model & Light Priority (Gemini / HA AI)"
+  description: Analyze recorded user manual adjustments, calibration presses, and light fixture capabilities using Home Assistant's AI Task / Gemini integration (with local factorial fallback) to refine room thresholds, models, and progressive light-shedding order.
   fields:
     room_id:
       name: Room ID or Name (Optional)
@@ -189,3 +189,89 @@ optimize_with_ai:
       example: "living_room"
       selector:
         text:
+
+reset_room:
+  name: Reset Room or All Rooms Calibration & Learned State
+  description: Reset all learned thresholds, brightness targets, nudges, observations, and overrides for a specific room (or all rooms if room_id is omitted or 'all') back to clean defaults.
+  fields:
+    room_id:
+      name: Room ID or Name (Optional, or 'all')
+      description: Specify a room (e.g., utility) or 'all' (or leave empty) to reset all rooms.
+      required: false
+      example: "utility"
+      selector:
+        text:
+
+update_room_config:
+  name: Update Room Configuration (Sidebar UI)
+  description: Live-update a room's operating mode, per-regime scenes, off-state scene overrides, turn-on thresholds, target brightness, scene triggers, light shedding priority order, or entity exclusions.
+  fields:
+    room_id:
+      name: Room ID or Name
+      required: true
+      example: "living_room"
+      selector:
+        text:
+    operating_mode:
+      name: Operating Mode
+      required: false
+      selector:
+        select:
+          options:
+            - "full_adaptive"
+            - "simple_transit"
+            - "sensor_only"
+    light_priority_order:
+      name: Light Shedding Priority Order (Shed 1st to Keep Last)
+      required: false
+      selector:
+        object:
+    light_order_locked:
+      name: Lock Custom Light Order
+      required: false
+      selector:
+        boolean:
+    regime_configs:
+      name: Per-Regime Scene & Threshold Configurations
+      required: false
+      selector:
+        object:
+    scene_triggers:
+      name: Per-Regime Entity Scene Triggers
+      required: false
+      selector:
+        object:
+    excluded_entities:
+      name: Excluded Entities
+      required: false
+      selector:
+        object:
+
+update_hub_config:
+  name: Update Global Hub & Time-of-Day Regime Schedule
+  description: Live-update the global Time-of-Day Regime Schedule (mode, start hours, solar elevations, weather gloom shift, smooth cross-fade minutes), weather entity, outdoor sensors, or add/remove rooms.
+  fields:
+    regime_schedule:
+      name: Time-of-Day Regime Schedule & Factors
+      required: false
+      selector:
+        object:
+    weather_entity:
+      name: Weather Entity
+      required: false
+      selector:
+        entity:
+          domain: weather
+    outdoor_sensors:
+      name: Outdoor Illuminance Sensors
+      required: false
+      selector:
+        entity:
+          domain: sensor
+          device_class: illuminance
+          multiple: true
+    global_lock:
+      name: Global Automation Lock
+      required: false
+      selector:
+        boolean:

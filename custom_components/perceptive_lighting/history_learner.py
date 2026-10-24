@@ -1,12 +1,13 @@
-"""Historical Recorder Bootstrap & Sensor Outlier Learner for Perceptive Lighting (v1.3.0).
+"""Historical Recorder Bootstrap & Sensor Outlier Learner for Perceptive Lighting (v2.0.0).
 
-Analyzes the past 7-14 days of Home Assistant Recorder history for indoor and
+Analyzes the past 10 days of Home Assistant Recorder history for indoor and
 outdoor illuminance sensors alongside historical solar azimuth/elevation to:
-1. Automatically detect which compass direction a room's windows or outdoor sensors face.
-2. Detect High-Floor / Early Drop-Out sensors (sensors that drop to 0 lx early at dusk
-   but provide valuable spatial data during brighter hours) and set `floor_lux` + `dropout_knee_lux`.
+1. Parse both full State objects and compact `minimal_response` dicts so all historical
+   samples are analyzed accurately.
+2. Automatically detect which compass direction a room's windows or outdoor sensors face.
 3. Detect Dead / Flatline / Obstructed outlier sensors (`base_trust_weight = 0.0`, `suggest_blacklist = True`).
-4. Estimate per-sensor placement multipliers and initial location classification (`ai_location_guess`).
+4. Conservative High-Floor / Early Drop-Out detection (only when a sensor has a high daytime peak
+   AND sibling sensors prove it drops to 0 prematurely).
 """
 from __future__ import annotations
 
@@ -43,6 +44,47 @@ def _estimate_solar_position(
         return el, az % 360.0
 
 
+def _extract_state_and_timestamp(st: Any) -> tuple[str | None, datetime | None]:
+    """Extract state string and UTC datetime from either a HA State/LazyState object or minimal_response dict."""
+    if isinstance(st, dict):
+        raw_state = st.get("s", st.get("state"))
+        raw_ts = (
+            st.get("lu")
+            or st.get("lc")
+            or st.get("last_updated")
+            or st.get("last_changed")
+        )
+    else:
+        raw_state = getattr(st, "state", None)
+        raw_ts = (
+            getattr(st, "last_updated_ts", None)
+            or getattr(st, "last_changed_ts", None)
+            or getattr(st, "last_updated", None)
+            or getattr(st, "last_changed", None)
+        )
+
+    if raw_state is None:
+        return None, None
+
+    ts_dt: datetime | None = None
+    if isinstance(raw_ts, (int, float)):
+        try:
+            ts_dt = datetime.fromtimestamp(float(raw_ts), tz=timezone.utc)
+        except Exception:  # noqa: BLE001
+            ts_dt = None
+    elif isinstance(raw_ts, datetime):
+        ts_dt = raw_ts if raw_ts.tzinfo is not None else raw_ts.replace(tzinfo=timezone.utc)
+    elif isinstance(raw_ts, str):
+        try:
+            ts_dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+        except Exception:  # noqa: BLE001
+            ts_dt = None
+
+    return str(raw_state), ts_dt
+
+
 async def async_learn_sensor_profiles_from_history(
     hass: HomeAssistant,
     entity_ids: list[str],
@@ -50,7 +92,7 @@ async def async_learn_sensor_profiles_from_history(
     days_back: int = 10,
     is_outdoor: bool = False,
 ) -> dict[str, SensorLearnedProfile]:
-    """Query Home Assistant Recorder history and compute learned profiles + outlier curves for lux sensors."""
+    """Query Home Assistant Recorder history and compute learned profiles for lux sensors."""
     profiles: dict[str, SensorLearnedProfile] = {}
     if existing_profiles:
         for k, v in existing_profiles.items():
@@ -108,7 +150,7 @@ async def async_learn_sensor_profiles_from_history(
         nonzero_values: list[float] = []
 
         for st in states:
-            raw_state = getattr(st, "state", None)
+            raw_state, ts = _extract_state_and_timestamp(st)
             if raw_state in (None, "unknown", "unavailable"):
                 continue
             try:
@@ -119,15 +161,12 @@ async def async_learn_sensor_profiles_from_history(
             if lux_val < 0.0:
                 continue
 
-            ts = getattr(st, "last_updated", None) or getattr(st, "last_changed", None)
-            if ts is None:
-                continue
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-
             all_values.append(lux_val)
             if lux_val > 0.5:
                 nonzero_values.append(lux_val)
+
+            if ts is None:
+                continue
 
             sol_el, sol_az = _estimate_solar_position(hass, ts)
             if sol_el > 8.0:
@@ -141,25 +180,32 @@ async def async_learn_sensor_profiles_from_history(
 
         prof = profiles[eid]
         prof.samples_analyzed = len(all_values)
+        # Clear any old hallucinated floor/knee unless proven below
+        prof.floor_lux = 0.0
+        prof.dropout_knee_lux = 0.0
 
         if nonzero_values:
             s_nz = sorted(nonzero_values)
             sensor_min_nonzero[eid] = s_nz[max(0, int(len(s_nz) * 0.05))]
 
         if twilight_values:
-            zero_cnt = sum(1 for v in twilight_values if v <= 1.0)
+            zero_cnt = sum(1 for v in twilight_values if v <= 0.5)
             sensor_twilight_zero_ratio[eid] = zero_cnt / len(twilight_values)
 
-        if len(all_values) >= 6:
+        if len(all_values) >= 8:
             s_all = sorted(all_values)
             p5_all = s_all[int(len(s_all) * 0.05)]
             p95_all = s_all[min(len(s_all) - 1, int(len(s_all) * 0.95))]
-            # Flatline / stuck / obstructed sensor detection
-            if (p95_all - p5_all) <= 1.0 and p95_all <= 2.0:
+            # Flatline / stuck / obstructed sensor detection (e.g. stuck at 0 lx)
+            if (p95_all - p5_all) <= 0.5 and p95_all <= 1.0:
                 prof.base_trust_weight = 0.0
                 prof.suggest_blacklist = True
-                prof.ai_location_guess = "Flatlined / Obstructed (0-2 lx constant — Recommend Blacklist)"
+                prof.ai_location_guess = "Flatlined / Obstructed (0 lx constant — Recommend Blacklist)"
                 continue
+            else:
+                if prof.suggest_blacklist and p95_all > 2.0:
+                    prof.suggest_blacklist = False
+                    prof.base_trust_weight = 1.0
 
         if len(daytime_values) >= 6:
             sorted_day = sorted(daytime_values)
@@ -187,7 +233,7 @@ async def async_learn_sensor_profiles_from_history(
                 if ratio >= 1.28 or is_outdoor:
                     prof.peak_solar_azimuth = round(best_bin * 30.0 + 15.0, 1)
 
-    # Multi-sensor comparison & High-Floor / Early Drop-Out Detection
+    # Multi-sensor comparison (Keep learned_multiplier close to 1.0 so Total Room Lux reflects real sensor lux!)
     if not is_outdoor and sensor_daytime_medians:
         med_values = list(sensor_daytime_medians.values())
         room_geo_mean = math.exp(sum(math.log(v) for v in med_values) / len(med_values))
@@ -197,34 +243,27 @@ async def async_learn_sensor_profiles_from_history(
             if prof.suggest_blacklist:
                 continue
 
-            if len(sensor_daytime_medians) >= 2 and prof.placement == "auto_learn":
-                raw_ratio = room_geo_mean / max(1.0, s_med)
-                prof.learned_multiplier = round(
-                    clamp(math.pow(raw_ratio, 0.55), 0.55, 1.85), 3
-                )
+            # Keep learned_multiplier at 1.0 by default so Total Room Lux matches what the user sees on the sensors
+            prof.learned_multiplier = 1.0
 
-            # Check for High Dark-Floor / Early Drop-Out behavior:
-            # If sensor jumps from 0 directly to >= 4 lx OR spends >55% of civil twilight at <=1 lx
-            # while having a healthy daytime p95 (>35 lx), configure smooth floor tapering!
             min_nz = sensor_min_nonzero.get(eid, 1.0)
             twi_zero = sensor_twilight_zero_ratio.get(eid, 0.0)
-            p95_day = sensor_daytime_p95.get(eid, 20.0)
+            p95_day = sensor_daytime_p95.get(eid, 15.0)
 
-            if p95_day >= 25.0 and (min_nz >= 4.0 or twi_zero >= 0.55):
-                prof.floor_lux = round(max(1.0, min_nz * 0.6), 1)
-                prof.dropout_knee_lux = round(max(10.0, min_nz * 2.5, prof.floor_lux + 8.0), 1)
-                if not prof.ai_location_guess:
-                    prof.ai_location_guess = (
-                        f"High Dark-Floor Sensor (tapers below {prof.dropout_knee_lux} lx)"
-                    )
-            elif not prof.ai_location_guess:
+            # Only set a gentle floor knee if there are >= 2 working sensors in the room AND this sensor
+            # drops directly from >= 6 lx to 0 lx while having a bright daytime peak (>= 45 lx)
+            if len(sensor_daytime_medians) >= 2 and p95_day >= 45.0 and min_nz >= 6.0 and twi_zero >= 0.70:
+                prof.floor_lux = round(max(1.0, min_nz * 0.5), 1)
+                prof.dropout_knee_lux = round(min(8.0, prof.floor_lux + 4.0), 1)
+                prof.ai_location_guess = f"High Dark-Floor Sensor (tapers below {prof.dropout_knee_lux} lx)"
+            else:
                 if prof.direct_sun_ratio >= 1.8:
-                    prof.ai_location_guess = "Near Window (Direct Solar Glare Peak)"
-                elif prof.learned_multiplier >= 1.25:
-                    prof.ai_location_guess = "Dim Interior / Shaded Corner"
-                elif prof.learned_multiplier <= 0.78:
-                    prof.ai_location_guess = "Bright Exposure / Near Glazing"
+                    prof.ai_location_guess = f"Near Window (Day median {s_med:.1f} lx)"
+                elif s_med < room_geo_mean * 0.65:
+                    prof.ai_location_guess = f"Shaded Interior (Day median {s_med:.1f} lx)"
+                elif s_med > room_geo_mean * 1.45:
+                    prof.ai_location_guess = f"Bright Exposure (Day median {s_med:.1f} lx)"
                 else:
-                    prof.ai_location_guess = "Balanced Room Interior"
+                    prof.ai_location_guess = f"Balanced Room Sensor (Day median {s_med:.1f} lx)"
 
     return profiles

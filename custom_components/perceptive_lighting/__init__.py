@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 import voluptuous as vol
 
+from homeassistant.components import frontend
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
@@ -26,9 +27,16 @@ from .const import (
     SERVICE_NUDGE_FEEL,
     SERVICE_OPTIMIZE_WITH_AI,
     SERVICE_RELEARN_HISTORY,
+    SERVICE_RESET_ROOM,
     SERVICE_SET_WINDOW_COMPASS,
     SERVICE_UNLOCK_ROOM,
+    SERVICE_UPDATE_HUB_CONFIG,
+    SERVICE_UPDATE_ROOM_CONFIG,
     SERVICE_UPDATE_ROOM_EXCLUSIONS,
+    SIDEBAR_PANEL_COMPONENT_NAME,
+    SIDEBAR_PANEL_ICON,
+    SIDEBAR_PANEL_TITLE,
+    SIDEBAR_PANEL_URL_PATH,
     STATIC_URL_PATH,
     VERSION,
 )
@@ -46,9 +54,9 @@ PLATFORMS: list[Platform] = [
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
-    """Set up the Perceptive Lighting component and register bundled Lovelace cards."""
+    """Set up the Perceptive Lighting component, Sidebar panel, and bundled Lovelace cards."""
     hass.data.setdefault(DOMAIN, {})
-    await _async_register_frontend_cards(hass)
+    await _async_register_frontend_cards_and_panel(hass)
     _async_register_services(hass)
     return True
 
@@ -56,7 +64,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Perceptive Lighting from a config entry."""
     hass.data.setdefault(DOMAIN, {})
-    await _async_register_frontend_cards(hass)
+    await _async_register_frontend_cards_and_panel(hass)
     _async_register_services(hass)
 
     hub = PerceptiveLightingHub(hass, entry)
@@ -85,11 +93,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return unload_ok
 
 
-async def _async_register_frontend_cards(hass: HomeAssistant) -> None:
-    """Serve and auto-register the bundled Custom Lovelace Cards in both frontend and Lovelace storage."""
-    if hass.data[DOMAIN].get("_frontend_registered"):
-        return
-
+async def _async_register_frontend_cards_and_panel(hass: HomeAssistant) -> None:
+    """Serve and auto-register the Custom Sidebar Panel and bundled Lovelace Cards."""
     frontend_dir = Path(__file__).parent / "frontend"
     card_path = frontend_dir / CARD_JS_FILENAME
     if not card_path.exists():
@@ -99,48 +104,75 @@ async def _async_register_frontend_cards(hass: HomeAssistant) -> None:
     url_path = f"{STATIC_URL_PATH}/{CARD_JS_FILENAME}"
     versioned_url = f"{url_path}?v={VERSION}"
 
-    try:
-        await hass.http.async_register_static_paths(
-            [StaticPathConfig(STATIC_URL_PATH, str(frontend_dir), cache_headers=False)]
+    if not hass.data[DOMAIN].get("_static_registered"):
+        try:
+            await hass.http.async_register_static_paths(
+                [StaticPathConfig(STATIC_URL_PATH, str(frontend_dir), cache_headers=False)]
+            )
+        except AttributeError:
+            hass.http.register_static_path(
+                STATIC_URL_PATH, str(frontend_dir), cache_headers=False
+            )
+        except RuntimeError:
+            pass
+        hass.data[DOMAIN]["_static_registered"] = True
+
+    if hass.data[DOMAIN].get("_frontend_version") != VERSION:
+        add_extra_js_url(hass, versioned_url)
+
+        # Register Custom Sidebar Panel in Home Assistant's Left Navigation Menu
+        try:
+            frontend.async_register_built_in_panel(
+                hass,
+                component_name="custom",
+                sidebar_title=SIDEBAR_PANEL_TITLE,
+                sidebar_icon=SIDEBAR_PANEL_ICON,
+                frontend_url_path=SIDEBAR_PANEL_URL_PATH,
+                config={
+                    "_panel_custom": {
+                        "name": SIDEBAR_PANEL_COMPONENT_NAME,
+                        "module_url": versioned_url,
+                        "embed_iframe": False,
+                        "trust_external": False,
+                    }
+                },
+                require_admin=False,
+                update=True,
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Could not register Perceptive Lighting sidebar panel: %s", err)
+
+        # Also register in Lovelace ResourceStorageCollection so the visual Card Picker always loads it as an ES module
+        try:
+            lovelace = hass.data.get("lovelace")
+            resources = getattr(lovelace, "resources", None)
+            if resources is None and isinstance(lovelace, dict):
+                resources = lovelace.get("resources")
+            if resources is not None:
+                if not getattr(resources, "loaded", True):
+                    await resources.async_load()
+                existing_items = list(resources.async_items() or [])
+                matched = None
+                for item in existing_items:
+                    if STATIC_URL_PATH in item.get("url", ""):
+                        matched = item
+                        break
+                if matched is None:
+                    await resources.async_create_item(
+                        {"res_type": "module", "url": versioned_url}
+                    )
+                elif matched.get("url") != versioned_url:
+                    await resources.async_update_item(
+                        matched["id"], {"res_type": "module", "url": versioned_url}
+                    )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Could not auto-register in Lovelace resources storage: %s", err)
+
+        hass.data[DOMAIN]["_frontend_version"] = VERSION
+        _LOGGER.info(
+            "Registered Perceptive Lighting sidebar panel (/perceptive-lighting) and Lovelace cards at %s",
+            versioned_url,
         )
-    except AttributeError:
-        hass.http.register_static_path(
-            STATIC_URL_PATH, str(frontend_dir), cache_headers=False
-        )
-    except RuntimeError:
-        # Path already registered
-        pass
-
-    add_extra_js_url(hass, versioned_url)
-
-    # Also register in Lovelace ResourceStorageCollection so the visual Card Picker always loads it as an ES module
-    try:
-        lovelace = hass.data.get("lovelace")
-        resources = getattr(lovelace, "resources", None)
-        if resources is None and isinstance(lovelace, dict):
-            resources = lovelace.get("resources")
-        if resources is not None:
-            if not getattr(resources, "loaded", True):
-                await resources.async_load()
-            existing_items = list(resources.async_items() or [])
-            matched = None
-            for item in existing_items:
-                if STATIC_URL_PATH in item.get("url", ""):
-                    matched = item
-                    break
-            if matched is None:
-                await resources.async_create_item(
-                    {"res_type": "module", "url": versioned_url}
-                )
-            elif matched.get("url") != versioned_url:
-                await resources.async_update_item(
-                    matched["id"], {"res_type": "module", "url": versioned_url}
-                )
-    except Exception as err:  # noqa: BLE001
-        _LOGGER.debug("Could not auto-register in Lovelace resources storage: %s", err)
-
-    hass.data[DOMAIN]["_frontend_registered"] = True
-    _LOGGER.info("Registered Perceptive Lighting custom Lovelace cards at %s", versioned_url)
 
 
 def _find_room(hass: HomeAssistant, room_key: str) -> RoomController | None:
@@ -162,7 +194,7 @@ def _find_room(hass: HomeAssistant, room_key: str) -> RoomController | None:
 
 def _async_register_services(hass: HomeAssistant) -> None:
     """Register Perceptive Lighting domain services/actions."""
-    if hass.services.has_service(DOMAIN, SERVICE_APPLY_ADAPTIVE_SCENE):
+    if hass.services.has_service(DOMAIN, SERVICE_UPDATE_ROOM_CONFIG):
         return
 
     async def handle_apply_adaptive_scene(call: ServiceCall) -> None:
@@ -201,7 +233,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
         if room:
             await room.async_nudge_feel(
                 direction=call.data.get("direction", "more_light"),
-                step_pct=float(call.data.get("step_pct", 8.0)),
+                step_pct=float(call.data.get("step_pct", 10.0)),
             )
 
     async def handle_calibrate_feels_dark_now(call: ServiceCall) -> None:
@@ -223,20 +255,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
         room = _find_room(hass, call.data["room_id"])
         if room:
             excluded = list(call.data.get("excluded_entities", []))
-            room.config[CONF_EXCLUDED_ENTITIES] = excluded
-            room.async_discover_area_entities()
-            room.async_evaluate_room(room.hub.outdoor_state, trigger_control=True)
-
-            # Persist updated blacklist in config_entry options
-            entry = room.hub.entry
-            new_opts = dict(entry.options or entry.data)
-            rooms_map = dict(new_opts.get(CONF_ROOMS, {}))
-            if room.room_id in rooms_map:
-                rcfg = dict(rooms_map[room.room_id])
-                rcfg[CONF_EXCLUDED_ENTITIES] = excluded
-                rooms_map[room.room_id] = rcfg
-                new_opts[CONF_ROOMS] = rooms_map
-                hass.config_entries.async_update_entry(entry, options=new_opts)
+            await room.async_update_room_config({CONF_EXCLUDED_ENTITIES: excluded})
 
     async def handle_relearn_history(call: ServiceCall) -> None:
         for val in hass.data.get(DOMAIN, {}).values():
@@ -254,6 +273,32 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 if isinstance(val, PerceptiveLightingHub):
                     for room in val.rooms.values():
                         await room.async_optimize_with_gemini()
+
+    async def handle_reset_room(call: ServiceCall) -> None:
+        room_key = call.data.get("room_id")
+        if not room_key or str(room_key).lower().strip() == "all":
+            for val in hass.data.get(DOMAIN, {}).values():
+                if isinstance(val, PerceptiveLightingHub):
+                    await val.async_reset_all_rooms()
+        else:
+            room = _find_room(hass, room_key)
+            if room:
+                await room.async_reset_room(relearn_history=True)
+
+    async def handle_update_room_config(call: ServiceCall) -> None:
+        room_key = call.data.get("room_id")
+        if not room_key:
+            return
+        room = _find_room(hass, room_key)
+        if room:
+            updates = {k: v for k, v in call.data.items() if k != "room_id"}
+            await room.async_update_room_config(updates)
+
+    async def handle_update_hub_config(call: ServiceCall) -> None:
+        updates = dict(call.data)
+        for val in hass.data.get(DOMAIN, {}).values():
+            if isinstance(val, PerceptiveLightingHub):
+                await val.async_update_hub_config(updates)
 
     hass.services.async_register(
         DOMAIN,
@@ -309,7 +354,7 @@ def _async_register_services(hass: HomeAssistant) -> None:
             {
                 vol.Required("room_id"): str,
                 vol.Required("direction"): str,
-                vol.Optional("step_pct", default=8.0): vol.Coerce(float),
+                vol.Optional("step_pct", default=10.0): vol.Coerce(float),
             }
         ),
     )
@@ -358,4 +403,22 @@ def _async_register_services(hass: HomeAssistant) -> None:
         SERVICE_OPTIMIZE_WITH_AI,
         handle_optimize_with_ai,
         schema=vol.Schema({vol.Optional("room_id"): str}),
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RESET_ROOM,
+        handle_reset_room,
+        schema=vol.Schema({vol.Optional("room_id"): str}),
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_UPDATE_ROOM_CONFIG,
+        handle_update_room_config,
+        schema=vol.Schema({vol.Required("room_id"): str}, extra=vol.ALLOW_EXTRA),
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_UPDATE_HUB_CONFIG,
+        handle_update_hub_config,
+        schema=vol.Schema({}, extra=vol.ALLOW_EXTRA),
     )

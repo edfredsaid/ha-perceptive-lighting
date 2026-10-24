@@ -1,4 +1,4 @@
-"""Button platform for Perceptive Lighting (Micro-Step Feel Nudging & Calibration)."""
+"""Button platform for Perceptive Lighting (Direct Control, Calibration, AI Optimization & Reset)."""
 from __future__ import annotations
 
 from homeassistant.components.button import ButtonEntity
@@ -16,7 +16,7 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Perceptive Lighting micro-nudge and calibration buttons."""
+    """Set up Perceptive Lighting direct control, calibration, AI, and reset buttons."""
     hub: PerceptiveLightingHub = hass.data[DOMAIN][entry.entry_id]
     entities: list[ButtonEntity] = []
     for room in hub.rooms.values():
@@ -27,6 +27,7 @@ async def async_setup_entry(
                 RoomCalibrateFeelsDarkNowButton(room),
                 RoomCalibrateFeelsBrightNowButton(room),
                 RoomOptimizeWithGeminiButton(room),
+                RoomResetCalibrationButton(room),
             ]
         )
     async_add_entities(entities)
@@ -53,7 +54,7 @@ class BaseRoomButton(ButtonEntity):
 
 
 class RoomNudgeNeedsMoreLightButton(BaseRoomButton):
-    """Step button: Nudge room to feel like it needs more light (+8%)."""
+    """Direct control & learn button: Increase brightness (+10%) or restore a shed light and record resulting lux."""
 
     def __init__(self, room: RoomController) -> None:
         super().__init__(
@@ -68,7 +69,7 @@ class RoomNudgeNeedsMoreLightButton(BaseRoomButton):
 
 
 class RoomNudgeTooBrightButton(BaseRoomButton):
-    """Step button: Nudge room to feel like it is too bright (-8%)."""
+    """Direct control & learn button: Decrease brightness down to 1%, then shed one light source at a time (never turns all lights off)."""
 
     def __init__(self, room: RoomController) -> None:
         super().__init__(
@@ -125,3 +126,18 @@ class RoomOptimizeWithGeminiButton(BaseRoomButton):
 
     async def async_press(self) -> None:
         await self.room.async_optimize_with_gemini()
+
+
+class RoomResetCalibrationButton(BaseRoomButton):
+    """Reset button: Clear all learned weights, nudges, observations, and overrides for this room back to clean defaults."""
+
+    def __init__(self, room: RoomController) -> None:
+        super().__init__(
+            room,
+            "reset_room_calibration",
+            "Reset Room Calibration & Learned State",
+            "mdi:restore",
+        )
+
+    async def async_press(self) -> None:
+        await self.room.async_reset_room(relearn_history=True)
