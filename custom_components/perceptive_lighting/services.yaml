@@ -1,0 +1,168 @@
+apply_adaptive_scene:
+  name: Apply Adaptive Scene or Activity
+  description: Activate an Adaptive Scene or Activity in a room with brightness dynamically scaled to the current Perceptive Lighting Deficit.
+  fields:
+    room_id:
+      name: Room ID or Name
+      description: The room area ID or friendly name (e.g., living_room).
+      required: true
+      example: "living_room"
+      selector:
+        text:
+    scene:
+      name: Scene or Activity
+      description: The Adaptive Scene ID, friendly name (e.g., Chilling, Working, Film), or 'default'.
+      required: true
+      example: "activity_working"
+      selector:
+        text:
+
+capture_adaptive_scene:
+  name: Capture Current Lights as Adaptive Scene
+  description: Snapshot the room's current light states alongside the current Perceptive Lighting Deficit as a reusable Adaptive Scene.
+  fields:
+    room_id:
+      name: Room ID or Name
+      required: true
+      example: "living_room"
+      selector:
+        text:
+    name:
+      name: Scene Name
+      description: Display name for the new Adaptive Scene (e.g., Reading, Board Games).
+      required: true
+      example: "Reading"
+      selector:
+        text:
+    activity:
+      name: Base Activity Curve
+      description: Optional perceptual activity curve to associate with this scene.
+      required: false
+      selector:
+        select:
+          options:
+            - "relaxing"
+            - "working"
+            - "reading"
+            - "film"
+            - "sleep_prep"
+            - "transit"
+            - "bright_task"
+
+delete_adaptive_scene:
+  name: Delete Adaptive Scene
+  description: Remove a captured Adaptive Scene from a room.
+  fields:
+    room_id:
+      name: Room ID or Name
+      required: true
+      selector:
+        text:
+    scene_id:
+      name: Scene ID
+      required: true
+      selector:
+        text:
+
+lock_room:
+  name: Lock Room Automation
+  description: Hard-lock all presence and automatic lighting adjustments for a room until explicitly unlocked.
+  fields:
+    room_id:
+      name: Room ID or Name
+      required: true
+      example: "living_room"
+      selector:
+        text:
+
+unlock_room:
+  name: Unlock Room Automation
+  description: Unlock automatic presence and Perceptive Lighting control for a room.
+  fields:
+    room_id:
+      name: Room ID or Name
+      required: true
+      example: "living_room"
+      selector:
+        text:
+
+nudge_feel:
+  name: Micro-Nudge Room Perceptual Feel
+  description: Nudge a room's perceptual target slightly lighter (+2% Needs More Light) or darker (-2% Too Bright) for the current time of day.
+  fields:
+    room_id:
+      name: Room ID or Name
+      required: true
+      example: "living_room"
+      selector:
+        text:
+    direction:
+      name: Direction
+      required: true
+      default: "more_light"
+      selector:
+        select:
+          options:
+            - "more_light"
+            - "too_bright"
+    step_pct:
+      name: Step Size (%)
+      required: false
+      default: 2.0
+      selector:
+        number:
+          min: 0.5
+          max: 15.0
+          step: 0.5
+
+calibrate_feels_dark_now:
+  name: "Calibrate: Room Feels Dark Now"
+  description: One-tap teaching action that calibrates the room's perceptual target so current natural lighting conditions trigger supplemental light.
+  fields:
+    room_id:
+      name: Room ID or Name
+      required: true
+      example: "living_room"
+      selector:
+        text:
+
+set_window_compass:
+  name: Set Window Compass Direction
+  description: Set the compass azimuth (0–360°) that the room's primary windows face.
+  fields:
+    room_id:
+      name: Room ID or Name
+      required: true
+      example: "living_room"
+      selector:
+        text:
+    azimuth:
+      name: Compass Azimuth (0–360°)
+      required: true
+      example: 180
+      selector:
+        number:
+          min: 0
+          max: 360
+          step: 1
+          unit_of_measurement: "°"
+
+update_room_exclusions:
+  name: Update Room Entity Blacklist
+  description: Update the list of excluded entities for a room.
+  fields:
+    room_id:
+      name: Room ID or Name
+      required: true
+      selector:
+        text:
+    excluded_entities:
+      name: Excluded Entities
+      required: true
+      selector:
+        entity:
+          multiple: true
+
+relearn_history:
+  name: Re-Learn Sensor Profiles from Recorder History
+  description: Re-analyze the past 10 days of Home Assistant Recorder history for all outdoor and indoor illuminance sensors.

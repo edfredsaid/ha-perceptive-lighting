@@ -1,0 +1,90 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Perceptive Lighting — Outdoor Environment",
+        "description": "Select your Home Assistant weather entity and any outdoor illuminance (lux) sensors. If no outdoor lux sensor is available, Perceptive Lighting automatically synthesizes outdoor illuminance from solar elevation and cloud cover.",
+        "data": {
+          "weather_entity": "Weather Entity",
+          "outdoor_sensors": "Outdoor Illuminance Sensor(s)"
+        }
+      },
+      "add_room_prompt": {
+        "title": "Rooms Configured ({room_count})",
+        "description": "Would you like to add a room to Perceptive Lighting now?",
+        "data": {
+          "add_another_room": "Add a Room now"
+        }
+      },
+      "room_basics": {
+        "title": "Configure Room — Space & Daylight",
+        "description": "Select the Home Assistant Area. All illuminance sensors, presence sensors, media players, lights, and scenes in that Area will be discovered automatically.",
+        "data": {
+          "area_id": "Home Assistant Room / Area",
+          "operating_mode": "Room Operating Mode",
+          "activities": "Activities Used in This Space (Multi-Select)",
+          "daylight_level": "Natural Daylight Exposure (Windows)",
+          "sun_window_direction": "When Does Direct Sun Shine Into Windows?"
+        }
+      },
+      "room_entities": {
+        "title": "{room_name} — Sensors, Exclusions & Lighting",
+        "description": "Auto-discovered {lux_count} illuminance sensor(s), {presence_count} presence sensor(s), and {light_count} light(s) in {room_name}. All room entities are included by default—only select entities below if you want to exclude them.",
+        "data": {
+          "excluded_entities": "Exclude Specific Entities (Blacklist)",
+          "include_media_players": "Keep Room Occupied While Media Players Are Playing",
+          "cct_mode": "Color Temperature (CCT) Control Mode",
+          "linked_ha_scenes": "Link Home Assistant Scenes as Adaptive Scenes",
+          "on_off_cooldown_minutes": "Anti-Flicker On/Off Lockout (Minutes)"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Perceptive Lighting is already configured. Use 'Configure' on the integration to add or edit rooms."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Perceptive Lighting Settings",
+        "data": {
+          "action": "Choose an Action"
+        }
+      },
+      "global_settings": {
+        "title": "Global Outdoor Sensors & Weather",
+        "data": {
+          "weather_entity": "Weather Entity",
+          "outdoor_sensors": "Outdoor Illuminance Sensor(s)"
+        }
+      },
+      "room_basics": {
+        "title": "Add or Edit Room — Space & Daylight",
+        "data": {
+          "area_id": "Home Assistant Room / Area",
+          "operating_mode": "Room Operating Mode",
+          "activities": "Activities Used in This Space (Multi-Select)",
+          "daylight_level": "Natural Daylight Exposure (Windows)",
+          "sun_window_direction": "When Does Direct Sun Shine Into Windows?"
+        }
+      },
+      "room_entities": {
+        "title": "{room_name} — Sensors, Exclusions & Lighting",
+        "description": "Auto-discovered {lux_count} illuminance sensor(s), {presence_count} presence sensor(s), and {light_count} light(s) in {room_name}.",
+        "data": {
+          "excluded_entities": "Exclude Specific Entities (Blacklist)",
+          "include_media_players": "Keep Room Occupied While Media Players Are Playing",
+          "cct_mode": "Color Temperature (CCT) Control Mode",
+          "linked_ha_scenes": "Link Home Assistant Scenes as Adaptive Scenes",
+          "on_off_cooldown_minutes": "Anti-Flicker On/Off Lockout (Minutes)"
+        }
+      },
+      "remove_room": {
+        "title": "Remove a Room",
+        "data": {
+          "room_to_remove": "Select Room to Remove"
+        }
+      }
+    }
+  }
+}
