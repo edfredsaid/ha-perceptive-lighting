@@ -2197,8 +2197,13 @@ class PerceptiveLightingHub:
             )
         )
 
-        # Schedule non-blocking historical Recorder bootstrap learning (WITHOUT blind initial AI call!)
-        self.hass.async_create_task(self.async_run_historical_learning())
+        # Schedule deferred background historical Recorder bootstrap learning after startup completes
+        async def _deferred_history_learn(_now: datetime) -> None:
+            await self.async_run_historical_learning()
+
+        self._unsub_listeners.append(
+            async_call_later(self.hass, 10.0, _deferred_history_learn)
+        )
 
     async def async_unload(self) -> None:
         """Clean up listeners on unload."""
