@@ -72,8 +72,11 @@ from .const import (
     SUN_DIR_AUTO,
     SUN_DIR_COMPASS,
 )
+from homeassistant.util import dt as dt_util
+
 from .ai_learner import (
     MAX_OBSERVATION_HISTORY,
+    OBSERVATIONS_BEFORE_AUTO_AI_CALL,
     LearnedRoomWeights,
     PerceptiveObservation,
     apply_online_sgd_step,
@@ -86,6 +89,7 @@ from .engine import (
     clamp,
     compute_outdoor_environment,
     compute_room_perceptive_illuminance,
+    estimate_day_length_hours,
 )
 from .history_learner import async_learn_sensor_profiles_from_history
 
@@ -151,11 +155,13 @@ class RoomController:
             CONF_OPERATING_MODE, MODE_FULL_ADAPTIVE
         )
 
-        # Discovered Area Entities (excluding blacklist)
+        # Discovered Area Entities (excluding blacklist & excluding TRV/climate devices for temp)
         self.lux_sensors: list[str] = []
         self.presence_sensors: list[str] = []
         self.media_players: list[str] = []
         self.lights: list[str] = []
+        self.temp_sensors: list[str] = []
+        self.humidity_sensors: list[str] = []
         self.all_area_entities: dict[str, list[str]] = {}
 
         # Per-sensor learned/configured profiles
@@ -170,6 +176,10 @@ class RoomController:
 
         # Persisted runtime state (nudges, lock, captured scenes, learned ML weights, observations)
         pstate = persisted_state or {}
+        for eid, pdata in pstate.get("sensor_profiles", {}).items():
+            if isinstance(pdata, dict):
+                self.sensor_profiles[eid] = SensorLearnedProfile.from_dict(pdata)
+
         self.automation_locked: bool = bool(pstate.get("automation_locked", False))
         self.feel_nudge_day_pct: float = float(pstate.get("feel_nudge_day_pct", 0.0))
         self.feel_nudge_night_pct: float = float(
@@ -183,6 +193,9 @@ class RoomController:
             room_config.get(CONF_DEFAULT_ACTIVITY, ACTIVITY_RELAXING),
         )
         self.active_scene_id: str = pstate.get("active_scene_id", "default")
+        self.min_artificial_lux: float = float(
+            pstate.get("min_artificial_lux", 12.0)
+        )
         self.max_artificial_lux: float = float(
             pstate.get("max_artificial_lux", 110.0)
         )
@@ -247,6 +260,7 @@ class RoomController:
             "window_azimuth": self.window_azimuth,
             "active_activity": self.active_activity,
             "active_scene_id": self.active_scene_id,
+            "min_artificial_lux": round(self.min_artificial_lux, 1),
             "max_artificial_lux": round(self.max_artificial_lux, 1),
             "learned_weights": self.learned_weights.to_dict(),
             "observations": [
@@ -262,29 +276,40 @@ class RoomController:
 
     @callback
     def async_discover_area_entities(self) -> None:
-        """Dynamically discover all relevant entities in the room's HA Area, minus exclusions."""
+        """Dynamically discover all relevant entities in the room's HA Area, minus exclusions & TRVs."""
         if not self.area_id:
             return
 
         ent_reg = er.async_get(self.hass)
         dev_reg = dr.async_get(self.hass)
 
-        # Find all devices in this area
-        area_device_ids = {
-            dev.id
-            for dev in dev_reg.devices.values()
-            if dev.area_id == self.area_id and not dev.disabled_by
-        }
+        # Find all devices in this area & identify TRV / climate devices to exclude from temp readings
+        area_device_ids: set[str] = set()
+        climate_or_trv_device_ids: set[str] = set()
+        trv_keywords = ("trv", "radiator", "valve", "thermostat", "heating", "boiler")
+
+        for dev in dev_reg.devices.values():
+            if dev.area_id == self.area_id and not dev.disabled_by:
+                area_device_ids.add(dev.id)
+                dev_label = f"{dev.name or ''} {dev.name_by_user or ''} {dev.model or ''}".lower()
+                if any(kw in dev_label for kw in trv_keywords):
+                    climate_or_trv_device_ids.add(dev.id)
+
+        # Any device that exposes a `climate` or `water_heater` entity is a TRV/thermostat heat source
+        for entry in ent_reg.entities.values():
+            if entry.domain in ("climate", "water_heater") and entry.device_id:
+                climate_or_trv_device_ids.add(entry.device_id)
 
         lux_list: list[str] = []
         pres_list: list[str] = []
         media_list: list[str] = []
         light_list: list[str] = []
+        temp_list: list[str] = []
+        hum_list: list[str] = []
 
         for entry in ent_reg.entities.values():
             if entry.disabled_by:
                 continue
-            # Exclude our own Perceptive Lighting entities!
             if entry.platform == DOMAIN:
                 continue
 
@@ -310,11 +335,36 @@ class RoomController:
                     else None
                 )
             )
+            fname = (
+                entry.name
+                or entry.original_name
+                or (state_obj.attributes.get("friendly_name", "") if state_obj else "")
+                or ""
+            ).lower()
+            eid_low = eid.lower()
 
             if domain == "sensor" and (
                 dev_class == "illuminance" or unit in ("lx", "lm/m²")
             ):
                 lux_list.append(eid)
+            elif domain == "sensor" and (
+                dev_class == "temperature" or unit in ("°C", "°F")
+            ):
+                # Exclude TRVs, radiator valves, and climate devices!
+                if (
+                    entry.device_id in climate_or_trv_device_ids
+                    or any(kw in eid_low or kw in fname for kw in trv_keywords)
+                    or "device_temperature" in eid_low
+                ):
+                    continue
+                temp_list.append(eid)
+            elif domain == "sensor" and dev_class == "humidity":
+                if (
+                    entry.device_id in climate_or_trv_device_ids
+                    or any(kw in eid_low or kw in fname for kw in trv_keywords)
+                ):
+                    continue
+                hum_list.append(eid)
             elif domain == "binary_sensor" and dev_class in (
                 "motion",
                 "occupancy",
@@ -324,13 +374,6 @@ class RoomController:
             elif domain == "media_player":
                 media_list.append(eid)
             elif domain == "light":
-                fname = (
-                    entry.name
-                    or entry.original_name
-                    or (state_obj.attributes.get("friendly_name", "") if state_obj else "")
-                    or ""
-                ).lower()
-                eid_low = eid.lower()
                 if (
                     "segment" in eid_low
                     or "segment" in fname
@@ -343,6 +386,8 @@ class RoomController:
 
         self.all_area_entities = {
             "illuminance_sensors": sorted(lux_list),
+            "temperature_sensors": sorted(temp_list),
+            "humidity_sensors": sorted(hum_list),
             "presence_sensors": sorted(pres_list),
             "media_players": sorted(media_list),
             "lights": sorted(light_list),
@@ -350,6 +395,8 @@ class RoomController:
 
         excluded = self.excluded_entities
         self.lux_sensors = [e for e in self.all_area_entities["illuminance_sensors"] if e not in excluded]
+        self.temp_sensors = [e for e in self.all_area_entities["temperature_sensors"] if e not in excluded]
+        self.humidity_sensors = [e for e in self.all_area_entities["humidity_sensors"] if e not in excluded]
         self.presence_sensors = [e for e in self.all_area_entities["presence_sensors"] if e not in excluded]
         self.media_players = (
             [e for e in self.all_area_entities["media_players"] if e not in excluded]
@@ -439,7 +486,7 @@ class RoomController:
                 except (ValueError, TypeError):
                     pass
 
-        # 2. Estimate artificial light contribution from active room lights
+        # 2. Estimate artificial light contribution from active room lights (including minimum artificial light floor)
         active_brightness_ratios: list[float] = []
         any_light_on = False
         for light_eid in self.lights:
@@ -453,20 +500,46 @@ class RoomController:
         self.controlled_lights_are_on = any_light_on
         if any_light_on and active_brightness_ratios:
             avg_bri_ratio = sum(active_brightness_ratios) / len(self.lights)
-            # Non-linear lumen output estimation
-            artificial_lux_est = self.max_artificial_lux * math.pow(avg_bri_ratio, 1.4)
+            # Non-linear lumen output bounded below by min_artificial_lux
+            span = max(0.0, self.max_artificial_lux - self.min_artificial_lux)
+            artificial_lux_est = self.min_artificial_lux + span * math.pow(avg_bri_ratio, 1.4)
         else:
             artificial_lux_est = 0.0
+
+        # 2b. Read standalone room environment sensors (Temperature & Humidity, TRVs already excluded)
+        temp_vals: list[float] = []
+        for teid in self.temp_sensors:
+            tst = self.hass.states.get(teid)
+            if tst and tst.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+                try:
+                    tval = float(tst.state)
+                    if tst.attributes.get("unit_of_measurement") == "°F":
+                        tval = (tval - 32.0) * 5.0 / 9.0
+                    temp_vals.append(tval)
+                except (ValueError, TypeError):
+                    pass
+        indoor_temp_c = (sum(temp_vals) / len(temp_vals)) if temp_vals else None
+
+        hum_vals: list[float] = []
+        for heid in self.humidity_sensors:
+            hst = self.hass.states.get(heid)
+            if hst and hst.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+                try:
+                    hum_vals.append(float(hst.state))
+                except (ValueError, TypeError):
+                    pass
+        indoor_humidity_pct = (sum(hum_vals) / len(hum_vals)) if hum_vals else None
 
         # 3. Check activity auto-triggers (e.g., TV playing -> film, PC on -> working)
         self._check_activity_triggers()
 
-        # 4. Run psychophysical calculation engine
+        # 4. Run psychophysical calculation engine with active Time-of-Day Regime's competing models
         sun_dir = self.config.get(CONF_SUN_WINDOW_DIRECTION, SUN_DIR_AUTO)
         if self.window_azimuth is not None and sun_dir == SUN_DIR_AUTO:
             sun_dir = SUN_DIR_COMPASS
 
-        prev_natural_pct = self.result.natural_perceptive_illuminance_pct
+        rspec = self.learned_weights.get_regime_spec(outdoor.time_regime)
+
         self.result = compute_room_perceptive_illuminance(
             indoor_sensor_readings=current_readings,
             sensor_profiles=self.sensor_profiles,
@@ -476,6 +549,8 @@ class RoomController:
             sun_window_direction=sun_dir,
             window_azimuth=self.window_azimuth,
             artificial_lux_estimate=artificial_lux_est,
+            min_artificial_lux=self.min_artificial_lux,
+            lights_are_on=any_light_on,
             feel_nudge_day_pct=self.feel_nudge_day_pct,
             feel_nudge_night_pct=self.feel_nudge_night_pct,
             learned_activity_mult=self.learned_weights.get_activity_multiplier(
@@ -485,6 +560,12 @@ class RoomController:
             learned_diffuse_sensitivity=self.learned_weights.diffuse_sky_sensitivity,
             learned_night_scale=self.learned_weights.night_comfort_scale,
             learned_brightness_scale=self.learned_weights.brightness_output_scale,
+            illum_model=rspec.illum_model,
+            weather_model=rspec.weather_model,
+            season_model=rspec.season_model,
+            regime_target_scale=rspec.target_scale,
+            indoor_temp_c=indoor_temp_c,
+            indoor_humidity_pct=indoor_humidity_pct,
         )
 
         # 5. Evaluate occupancy (presence sensors + optional media players)
@@ -565,7 +646,7 @@ class RoomController:
     async def _async_run_lighting_controller(
         self, occupancy_just_changed: bool = False, force_apply: bool = False
     ) -> None:
-        """Execute presence & perceptive deficit lighting control with anti-flicker guards."""
+        """Execute presence & perceptive deficit lighting control with anti-flicker & min-light-floor guards."""
         if self.operating_mode == MODE_SENSOR_ONLY:
             return
         if (
@@ -586,19 +667,17 @@ class RoomController:
                 self.last_on_off_change_utc = now
             return
 
-        # Case 2: Room is occupied (or force_apply from scene selector)
-        deficit = self.result.lighting_deficit_pct
+        # Case 2: Room is occupied (or force_apply from scene selector / calibration)
         rec_bri = self.result.recommended_brightness_pct
         rec_cct = self.result.recommended_cct_kelvin
 
-        # Should lights be ON or OFF based on perceptive deficit?
-        wants_lights_on = deficit >= 18.0 and rec_bri > 0
-        wants_lights_off = deficit <= 5.0
+        # Use Minimum Artificial Light Floor (Delta E_min) & Occupied Daylight Sufficiency boundaries
+        wants_lights_on = self.result.should_turn_lights_on and rec_bri > 0
+        wants_lights_off = self.result.should_turn_lights_off_while_occupied
 
         if not self.controlled_lights_are_on:
             # Lights are currently OFF
             if wants_lights_on or (force_apply and not wants_lights_off):
-                # Check 10-minute on/off lockout (unless presence just entered the room or user forced calibration/scene)
                 if (
                     not occupancy_just_changed
                     and not force_apply
@@ -606,14 +685,13 @@ class RoomController:
                 ):
                     return
                 await self._async_apply_active_scene_or_groups(
-                    max(15, rec_bri), rec_cct, transition=2 if (occupancy_just_changed or force_apply) else 15
+                    max(10, rec_bri), rec_cct, transition=2 if (occupancy_just_changed or force_apply) else 15
                 )
                 self.last_on_off_change_utc = now
                 self.last_adjustment_utc = now
         else:
             # Lights are currently ON while room is occupied
             if wants_lights_off:
-                # Only turn lights off while occupied if 10-minute cooldown has passed OR user is actively calibrating (force_apply)
                 if self.cooldown_active and not force_apply:
                     return
                 await self._async_turn_off_room_lights(transition=3 if force_apply else 20)
@@ -930,20 +1008,28 @@ class RoomController:
         desired_lights_on: bool,
         desired_bri_pct: int,
     ) -> None:
-        """Record a user interaction observation, run immediate Online ML SGD, and schedule Gemini AI optimization."""
+        """Record a user interaction observation, run immediate Local Factorial Model Fit, and conditionally trigger AI."""
         out = self.hub.outdoor_state
         obs = PerceptiveObservation(
             timestamp_utc=datetime.now(timezone.utc).isoformat(),
             event_type=event_type,
+            time_regime=out.time_regime,
             activity=self.active_activity,
             indoor_raw_lux=self.result.raw_lux,
             natural_spatial_lux=self.result.natural_spatial_lux,
             outdoor_sky_lux=out.effective_sky_lux,
+            weather_condition=out.weather_condition,
             cloud_cover_ratio=out.cloud_cover_ratio,
             diffuse_sky_factor=out.diffuse_sky_factor,
             solar_elevation=out.solar_elevation,
             solar_azimuth=out.solar_azimuth,
             is_daytime=out.is_daytime,
+            outdoor_temp_c=out.outdoor_temp_c,
+            indoor_temp_c=self.result.indoor_temp_c,
+            indoor_humidity_pct=self.result.indoor_humidity_pct,
+            day_length_hours=out.day_length_hours,
+            direct_sun_in_window=self.result.direct_sun_in_window,
+            internal_contrast_ratio=self.result.internal_contrast_ratio,
             model_target_lux=self.result.target_comfort_lux,
             model_deficit_pct=self.result.lighting_deficit_pct,
             model_recommended_bri_pct=self.result.recommended_brightness_pct,
@@ -954,23 +1040,34 @@ class RoomController:
         if len(self.observations) > MAX_OBSERVATION_HISTORY:
             self.observations = self.observations[-MAX_OBSERVATION_HISTORY:]
 
-        # 1. Immediate local Online ML contextual weight update
-        apply_online_sgd_step(self.learned_weights, obs)
+        # 1. Immediate local Factorial Competing-Model Selection + residual weight update (Zero API cost!)
+        apply_online_sgd_step(
+            self.learned_weights,
+            obs,
+            daylight_level=self.config.get(CONF_DAYLIGHT_LEVEL, DAYLIGHT_MEDIUM),
+            min_artificial_lux=self.min_artificial_lux,
+        )
 
-        # 2. Every 3 observations, trigger background Gemini AI optimization to synthesize patterns
+        # 2. Strictly Event-Driven AI Policy:
+        #    Only call Gemini automatically if >= 5 user corrections have accumulated AND at least 24 hours
+        #    have elapsed since the last AI call (never on a blind background timer!).
         self._obs_since_last_gemini_call += 1
-        if self._obs_since_last_gemini_call >= 3:
+        if (
+            self._obs_since_last_gemini_call >= OBSERVATIONS_BEFORE_AUTO_AI_CALL
+            and self.learned_weights.can_auto_call_ai_now()
+        ):
             self._obs_since_last_gemini_call = 0
             self.hass.async_create_task(self.async_optimize_with_gemini())
 
     async def async_optimize_with_gemini(self) -> bool:
-        """Invoke Home Assistant's Gemini AI (`ai_task` / `conversation`) to refine room weights from observation history."""
+        """Invoke Home Assistant's Gemini AI (`ai_task` / `conversation`) to calibrate competing models & sensor weights."""
         ok = await async_run_gemini_room_optimization(
             hass=self.hass,
             room_name=self.room_name,
             room_config=self.config,
             weights=self.learned_weights,
             observations=self.observations,
+            sensor_profiles=self.sensor_profiles,
             current_outdoor=self.hub.outdoor_state,
             current_result=self.result,
         )
@@ -1219,13 +1316,6 @@ class PerceptiveLightingHub:
                 timedelta(seconds=60),
             )
         )
-        self._unsub_listeners.append(
-            async_track_time_interval(
-                self.hass,
-                self._async_periodic_ai_optimization,
-                timedelta(hours=6),
-            )
-        )
 
         # Schedule non-blocking historical Recorder bootstrap learning
         self.hass.async_create_task(self.async_run_historical_learning())
@@ -1272,13 +1362,16 @@ class PerceptiveLightingHub:
                     days_back=10,
                     is_outdoor=False,
                 )
+            # Run one-time initial AI sensor & competing-model audit if not yet done for this room
+            if not room.learned_weights.initial_ai_audit_done:
+                await room.async_optimize_with_gemini()
 
         self.async_update_outdoor_and_rooms(trigger_control=False)
         await self.async_save_runtime_state()
 
     @callback
     def async_update_outdoor_and_rooms(self, trigger_control: bool = True) -> None:
-        """Read outdoor sensors, weather, and sun, then update all rooms."""
+        """Read outdoor sensors, weather, temperature, photoperiod, and sun, then update all rooms."""
         # 1. Read outdoor illuminance sensors
         outdoor_readings: dict[str, float] = {}
         for eid in self.outdoor_sensors:
@@ -1291,22 +1384,38 @@ class PerceptiveLightingHub:
                 except (ValueError, TypeError):
                     pass
 
-        # 2. Read weather entity
+        # 2. Read weather entity (condition, cloud_coverage, and outdoor temperature)
         weather_cond: str | None = None
         cloud_cov: float | None = None
+        outdoor_temp_c: float | None = None
         if self.weather_entity:
             wst = self.hass.states.get(self.weather_entity)
             if wst and wst.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
                 weather_cond = wst.state
                 cloud_cov = wst.attributes.get("cloud_coverage")
+                raw_temp = wst.attributes.get("temperature")
+                if raw_temp is not None:
+                    try:
+                        tval = float(raw_temp)
+                        t_unit = wst.attributes.get("temperature_unit", "°C")
+                        if t_unit == "°F":
+                            tval = (tval - 32.0) * 5.0 / 9.0
+                        outdoor_temp_c = tval
+                    except (ValueError, TypeError):
+                        pass
 
-        # 3. Read sun entity
+        # 3. Read sun entity & compute photoperiod + local hour
         sol_el = 15.0
         sol_az = 180.0
         sun_st = self.hass.states.get(self.sun_entity)
         if sun_st:
             sol_el = float(sun_st.attributes.get("elevation", 15.0))
             sol_az = float(sun_st.attributes.get("azimuth", 180.0))
+
+        now_local = dt_util.now()
+        local_hour = now_local.hour + now_local.minute / 60.0
+        lat = float(getattr(self.hass.config, "latitude", 51.5))
+        day_len = estimate_day_length_hours(lat, now_local.timetuple().tm_yday)
 
         self.outdoor_state = compute_outdoor_environment(
             sensor_readings=outdoor_readings,
@@ -1315,6 +1424,9 @@ class PerceptiveLightingHub:
             weather_cloud_coverage=cloud_cov,
             solar_elevation=sol_el,
             solar_azimuth=sol_az,
+            outdoor_temp_c=outdoor_temp_c,
+            day_length_hours=day_len,
+            local_hour=local_hour,
         )
 
         async_dispatcher_send(self.hass, SIGNAL_HUB_UPDATED)
@@ -1349,6 +1461,8 @@ class PerceptiveLightingHub:
                 entity_id in room.presence_sensors
                 or entity_id in room.media_players
                 or entity_id in room.lux_sensors
+                or entity_id in room.temp_sensors
+                or entity_id in room.humidity_sensors
                 or entity_id in room.config.get(CONF_ACTIVITY_TRIGGERS, {})
                 or entity_id in room.config.get(CONF_BLOCKER_ENTITIES, [])
             ):
@@ -1362,9 +1476,3 @@ class PerceptiveLightingHub:
         for room in self.rooms.values():
             room.async_discover_area_entities()
         self.async_update_outdoor_and_rooms(trigger_control=True)
-
-    async def _async_periodic_ai_optimization(self, _now: datetime) -> None:
-        """Periodic 6-hour background check to run Gemini AI model synthesis for rooms with observations."""
-        for room in self.rooms.values():
-            if room.observations:
-                await room.async_optimize_with_gemini()

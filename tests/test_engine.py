@@ -232,37 +232,137 @@ class TestPerceptiveEngine(unittest.TestCase):
         # Geometric blend ensures the 600 lx window sensor doesn't trick the room into thinking the dark corner is 310 lx
         self.assertLess(res.effective_spatial_lux, 200.0)
 
-    def test_online_ml_contextual_sgd_learning(self) -> None:
-        """Verify that Online ML attributes user feedback to the specific active environmental features."""
+    def test_online_ml_and_factorial_weather_model_selection(self) -> None:
+        """Verify that Factorial Backtesting swaps the Weather Model in the Day regime without corrupting Evening."""
         weights = LearnedRoomWeights()
-        # Scenario 1: Bright overcast day (12,000 lx outside), 28 lx natural indoors.
-        # Model predicted 115 lx target (lights ON), but user presses "Feels Bright Enough Now (Turn Off)".
-        obs_bright = PerceptiveObservation(
-            timestamp_utc="2026-10-24T12:00:00Z",
+        evening_before = weights.get_regime_spec("evening").to_dict()
+
+        # Sunny afternoon in 'day' regime: Cave Contrast predicted 140 lx target (lights ON),
+        # but user says "Feels Bright Enough Now (Turn Off)" at 75 lx natural indoors.
+        obs_sunny = PerceptiveObservation(
+            timestamp_utc="2026-10-24T14:30:00Z",
             event_type="feels_bright_now",
+            time_regime="day",
             activity=ACTIVITY_RELAXING,
-            indoor_raw_lux=28.0,
-            natural_spatial_lux=28.0,
-            outdoor_sky_lux=12000.0,
-            cloud_cover_ratio=0.85,
-            diffuse_sky_factor=1.18,
-            solar_elevation=32.0,
-            solar_azimuth=175.0,
+            indoor_raw_lux=75.0,
+            natural_spatial_lux=75.0,
+            outdoor_sky_lux=45000.0,
+            weather_condition="sunny",
+            cloud_cover_ratio=0.10,
+            diffuse_sky_factor=0.88,
+            solar_elevation=38.0,
+            solar_azimuth=210.0,
             is_daytime=True,
-            model_target_lux=115.0,
-            model_deficit_pct=55.0,
-            model_recommended_bri_pct=65,
+            outdoor_temp_c=22.0,
+            indoor_temp_c=22.5,
+            indoor_humidity_pct=45.0,
+            day_length_hours=14.5,
+            direct_sun_in_window=True,
+            internal_contrast_ratio=1.2,
+            model_target_lux=140.0,
+            model_deficit_pct=35.0,
+            model_recommended_bri_pct=45,
             user_desired_lights_on=False,
             user_desired_bri_pct=0,
         )
-        apply_online_sgd_step(weights, obs_bright)
+        apply_online_sgd_step(weights, obs_sunny)
 
-        # Because outdoor sky was bright and overcast when user said "bright enough",
-        # Online ML should reduce outdoor_adaptation_scale, reduce relaxing activity multiplier,
-        # and boost diffuse_sky_sensitivity!
-        self.assertLess(weights.get_activity_multiplier(ACTIVITY_RELAXING), 1.0)
-        self.assertLess(weights.outdoor_adaptation_scale, 1.0)
-        self.assertGreater(weights.diffuse_sky_sensitivity, 1.0)
+        day_spec = weights.get_regime_spec("day")
+        # Factorial backtest should switch 'day' weather model away from cave_contrast (e.g. to gloom_compensation)
+        self.assertNotEqual(day_spec.weather_model, "cave_contrast")
+        # And 'evening' regime must remain completely untouched!
+        self.assertEqual(weights.get_regime_spec("evening").to_dict(), evening_before)
+
+    def test_high_floor_sensor_dynamic_weighting(self) -> None:
+        """Verify that a sensor with a high dark floor gets 100% weight when bright, but tapers near 0 when dim."""
+        high_floor_prof = SensorLearnedProfile(
+            entity_id="sensor.high_floor_pir",
+            floor_lux=1.5,
+            dropout_knee_lux=16.0,
+        )
+        good_low_light_prof = SensorLearnedProfile(
+            entity_id="sensor.opt3001_desk",
+        )
+        # During daytime (60 lx), high-floor sensor has full 1.0 weight
+        self.assertEqual(high_floor_prof.compute_dynamic_weight(60.0), 1.0)
+        # At dusk when high-floor sensor drops early to 0.5 lx, its weight tapers to 0.05
+        self.assertLessEqual(high_floor_prof.compute_dynamic_weight(0.5), 0.06)
+
+        outdoor = compute_outdoor_environment(
+            sensor_readings={"sensor.outdoor_lux": 250.0},
+            sensor_profiles={},
+            weather_condition="cloudy",
+            weather_cloud_coverage=80.0,
+            solar_elevation=1.0,
+            solar_azimuth=250.0,
+        )
+        res = compute_room_perceptive_illuminance(
+            indoor_sensor_readings={
+                "sensor.high_floor_pir": 0.0,
+                "sensor.opt3001_desk": 24.0,
+            },
+            sensor_profiles={
+                "sensor.high_floor_pir": high_floor_prof,
+                "sensor.opt3001_desk": good_low_light_prof,
+            },
+            outdoor=outdoor,
+        )
+        # Because the 0.0 lx high-floor sensor is tapered down to 5% weight, spatial lux stays near 22-24 lx (not 12 lx!)
+        self.assertGreater(res.effective_spatial_lux, 20.0)
+
+    def test_seasonal_winter_vs_summer_and_min_artificial_floor(self) -> None:
+        """Verify seasonal/thermal bioclimatic model and minimum artificial light floor turn-on/off logic."""
+        outdoor_winter = compute_outdoor_environment(
+            sensor_readings={"sensor.outdoor_lux": 4000.0},
+            sensor_profiles={},
+            weather_condition="cloudy",
+            weather_cloud_coverage=90.0,
+            solar_elevation=16.0,
+            solar_azimuth=180.0,
+            outdoor_temp_c=2.0,
+            day_length_hours=8.0,
+            local_hour=13.0,
+        )
+        outdoor_summer = compute_outdoor_environment(
+            sensor_readings={"sensor.outdoor_lux": 4000.0},
+            sensor_profiles={},
+            weather_condition="cloudy",
+            weather_cloud_coverage=90.0,
+            solar_elevation=16.0,
+            solar_azimuth=180.0,
+            outdoor_temp_c=26.0,
+            day_length_hours=16.5,
+            local_hour=13.0,
+        )
+        res_winter = compute_room_perceptive_illuminance(
+            indoor_sensor_readings={"sensor.room_lux": 50.0},
+            sensor_profiles={},
+            outdoor=outdoor_winter,
+            season_model="combined_bioclimatic",
+            indoor_temp_c=18.5,
+        )
+        res_summer = compute_room_perceptive_illuminance(
+            indoor_sensor_readings={"sensor.room_lux": 50.0},
+            sensor_profiles={},
+            outdoor=outdoor_summer,
+            season_model="combined_bioclimatic",
+            indoor_temp_c=24.0,
+        )
+        # Cold short-day winter requires significantly higher comfort target than hot long-day summer
+        self.assertGreater(res_winter.target_comfort_lux, res_summer.target_comfort_lux * 1.25)
+
+        # Verify Minimum Artificial Light Floor: if natural lux is 96 lx and target is 100 lx (4 lx deficit),
+        # and min_artificial_lux is 18 lx, lights should NOT turn on and SHOULD turn off if currently on!
+        res_small_def = compute_room_perceptive_illuminance(
+            indoor_sensor_readings={"sensor.room_lux": 82.0},
+            sensor_profiles={},
+            outdoor=outdoor_summer,
+            season_model="combined_bioclimatic",
+            indoor_temp_c=24.0,
+            min_artificial_lux=20.0,
+        )
+        self.assertFalse(res_small_def.should_turn_lights_on)
+        self.assertTrue(res_small_def.should_turn_lights_off_while_occupied)
 
 
 if __name__ == "__main__":

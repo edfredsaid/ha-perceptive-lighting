@@ -5,7 +5,7 @@ from typing import Final
 
 DOMAIN: Final = "perceptive_lighting"
 NAME: Final = "Perceptive Lighting"
-VERSION: Final = "1.2.0"
+VERSION: Final = "1.3.0"
 
 # Static frontend URL for bundled custom Lovelace cards
 STATIC_URL_PATH: Final = "/perceptive_lighting_static"
@@ -232,3 +232,57 @@ SERVICE_SET_WINDOW_COMPASS: Final = "set_window_compass"
 SERVICE_UPDATE_ROOM_EXCLUSIONS: Final = "update_room_exclusions"
 SERVICE_RELEARN_HISTORY: Final = "relearn_history"
 SERVICE_OPTIMIZE_WITH_AI: Final = "optimize_with_ai"
+
+# 4 Distinct Time-of-Day Regimes
+REGIME_MORNING: Final = "morning"
+REGIME_DAY: Final = "day"
+REGIME_EVENING: Final = "evening"
+REGIME_OVERNIGHT: Final = "overnight"
+
+TIME_REGIMES: Final = (
+    REGIME_MORNING,
+    REGIME_DAY,
+    REGIME_EVENING,
+    REGIME_OVERNIGHT,
+)
+
+# Stage 1: Competing Base Illuminance & Retinal Adaptation Models (I1..I5)
+ILLUM_MODEL_WEBER_FECHNER: Final = "weber_fechner"
+ILLUM_MODEL_STEVENS_POWER: Final = "stevens_power"
+ILLUM_MODEL_NAKA_RUSHTON: Final = "naka_rushton"
+ILLUM_MODEL_CIE_DAYLIGHT: Final = "cie_daylight_factor"
+ILLUM_MODEL_CUTTLE_MRSE: Final = "cuttle_mrse"
+
+ILLUM_MODELS: Final = {
+    ILLUM_MODEL_WEBER_FECHNER: "Weber-Fechner Logarithmic Adaptation",
+    ILLUM_MODEL_STEVENS_POWER: "Stevens' Power Law Brightness Scaling",
+    ILLUM_MODEL_NAKA_RUSHTON: "Naka-Rushton Retinal Sigmoid",
+    ILLUM_MODEL_CIE_DAYLIGHT: "CIE Daylight Factor & Solar Penetration",
+    ILLUM_MODEL_CUTTLE_MRSE: "Cuttle MRSE Diffuse Flux Balance",
+}
+
+# Stage 2: Competing Weather & Sky Contrast Models (W1..W4)
+WEATHER_MODEL_CAVE_CONTRAST: Final = "cave_contrast"
+WEATHER_MODEL_GLOOM_COMPENSATION: Final = "gloom_compensation"
+WEATHER_MODEL_SOLAR_ALTITUDE: Final = "solar_altitude"
+WEATHER_MODEL_NEUTRAL: Final = "weather_neutral"
+
+WEATHER_MODELS: Final = {
+    WEATHER_MODEL_CAVE_CONTRAST: "Simultaneous Window Contrast (Cave Effect)",
+    WEATHER_MODEL_GLOOM_COMPENSATION: "Overcast Gloom Boost / Sunny Afternoon Relief",
+    WEATHER_MODEL_SOLAR_ALTITUDE: "Perez Sky & Solar Altitude Penetration",
+    WEATHER_MODEL_NEUTRAL: "Weather-Neutral (Indoor Lux Only)",
+}
+
+# Stage 3: Competing Seasonal, Photoperiod & Thermal Models (S1..S4)
+SEASON_MODEL_PHOTOPERIOD: Final = "photoperiod_sad"
+SEASON_MODEL_THERMAL_HUE_HEAT: Final = "thermal_hue_heat"
+SEASON_MODEL_BIOCLIMATIC: Final = "combined_bioclimatic"
+SEASON_MODEL_NEUTRAL: Final = "season_neutral"
+
+SEASON_MODELS: Final = {
+    SEASON_MODEL_PHOTOPERIOD: "Winter Photoperiod Affective Boost",
+    SEASON_MODEL_THERMAL_HUE_HEAT: "Thermal-Luminance (Cool Summer Oasis / Warm Winter)",
+    SEASON_MODEL_BIOCLIMATIC: "Combined Photoperiod & Thermal Comfort",
+    SEASON_MODEL_NEUTRAL: "Season & Temperature Neutral",
+}

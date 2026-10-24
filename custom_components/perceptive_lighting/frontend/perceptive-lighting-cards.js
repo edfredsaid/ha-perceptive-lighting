@@ -492,6 +492,8 @@ class PerceptiveRoomCard extends HTMLElement {
       const allArea = attr.all_area_entities || {};
       const allFlat = [
         ...(allArea.illuminance_sensors || []),
+        ...(allArea.temperature_sensors || []),
+        ...(allArea.humidity_sensors || []),
         ...(allArea.presence_sensors || []),
         ...(allArea.media_players || []),
         ...(allArea.lights || []),
@@ -512,18 +514,51 @@ class PerceptiveRoomCard extends HTMLElement {
         .join("");
 
       const lw = attr.learned_weights || {};
-      const actMults = lw.activity_target_multipliers || {};
-      const actMultVal = actMults[activeActivity] ?? 1.0;
+      const rmodels = lw.regime_models || {};
+      const curRegime = attr.time_regime || "day";
+      const curSpec = rmodels[curRegime] || {};
+      const sProfiles = attr.sensor_profiles || {};
+      const sDynWeights = attr.sensor_dynamic_weights || {};
+      const sBreakdown = attr.sensor_breakdown || {};
+
+      const sensorRowsHtml = Object.entries(sProfiles)
+        .map(([seid, prof]) => {
+          const dynW = Math.round((sDynWeights[seid] ?? prof.base_trust_weight ?? 1.0) * 100);
+          const curLx = sBreakdown[seid] ?? "--";
+          const locGuess = prof.ai_location_guess || prof.placement || "Auto";
+          const flagHtml = prof.suggest_blacklist
+            ? `<span style="color:#ef4444;font-weight:600;">⚠️ Suggest Blacklist</span>`
+            : prof.dropout_knee_lux > 0
+            ? `<span style="color:#f59e0b;">Floor taper &lt; ${prof.dropout_knee_lux} lx</span>`
+            : "";
+          return `
+            <div style="padding:5px 8px;border-radius:8px;background:rgba(128,128,128,0.08);margin-bottom:5px;font-size:0.78rem;">
+              <div style="display:flex;justify-content:space-between;gap:8px;">
+                <b>${seid}</b>
+                <span><b>${curLx} lx</b> • Weight: <b>${dynW}%</b></span>
+              </div>
+              <div style="color:var(--secondary-text-color);display:flex;justify-content:space-between;gap:8px;margin-top:2px;">
+                <span>📍 ${locGuess} (${prof.learned_multiplier ?? 1.0}x)</span>
+                ${flagHtml}
+              </div>
+            </div>
+          `;
+        })
+        .join("");
 
       settingsDrawerHtml = `
         <div class="drawer">
-          <h4>🧠 Learned ML & Gemini AI Weights (${attr.observation_count || 0} observations)</h4>
-          <div style="color:var(--secondary-text-color);margin-bottom:8px;line-height:1.45;">
-            • Activity (${activeActivity}) Target Scale: <b>${actMultVal}x</b><br/>
-            • Outdoor Cave-Contrast Adaptation: <b>${lw.outdoor_adaptation_scale ?? 1.0}x</b><br/>
-            • Overcast / Diffuse Sky Boost: <b>${lw.diffuse_sky_sensitivity ?? 1.0}x</b><br/>
-            • Evening / Night Comfort Scale: <b>${lw.night_comfort_scale ?? 1.0}x</b><br/>
-            • Artificial Brightness Scale: <b>${lw.brightness_output_scale ?? 1.0}x</b>
+          <h4>🧠 Competing Models — ${curRegime.toUpperCase()} Regime (${attr.observation_count || 0} obs)</h4>
+          <div style="color:var(--secondary-text-color);margin-bottom:10px;line-height:1.45;">
+            • Base Illuminance Model: <b>${attr.active_illum_model || curSpec.illum_model || "weber_fechner"}</b><br/>
+            • Weather & Sky Model: <b>${attr.active_weather_model || curSpec.weather_model || "cave_contrast"}</b> (${attr.weather_modifier ?? 1.0}x)<br/>
+            • Season & Thermal Model: <b>${attr.active_season_model || curSpec.season_model || "season_neutral"}</b> (${attr.season_thermal_modifier ?? 1.0}x)<br/>
+            • Regime Residual Scale: <b>${curSpec.target_scale ?? 1.0}x</b> • Min Artificial Floor: <b>${attr.min_artificial_lux ?? 12} lx</b>
+          </div>
+
+          <h4>🔬 Lux Sensor Placement & Dynamic Floor Weighting</h4>
+          <div style="margin-bottom:10px;">
+            ${sensorRowsHtml || "<div style='color:var(--secondary-text-color);'>No lux sensors profiled yet.</div>"}
           </div>
 
           <h4>🧭 Window Compass Calibration</h4>
@@ -553,10 +588,15 @@ class PerceptiveRoomCard extends HTMLElement {
 
     const aiInsightHtml = attr.ai_insight
       ? `<div style="margin:8px 0 4px 0;padding:8px 11px;border-radius:10px;background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.28);font-size:0.78rem;color:var(--primary-text-color);display:flex;align-items:center;justify-content:space-between;gap:8px;">
-           <span>🧠 <b>AI Model:</b> ${attr.ai_insight}</span>
+           <span>🧠 <b>Model (${(attr.time_regime || "day").toUpperCase()}):</b> ${attr.ai_insight}</span>
            <span style="color:var(--secondary-text-color);white-space:nowrap;">${attr.observation_count || 0} obs</span>
          </div>`
       : "";
+
+    const tempBadge =
+      attr.indoor_temp_c !== null && attr.indoor_temp_c !== undefined
+        ? `<span>• 🌡️ ${attr.indoor_temp_c}°C</span>`
+        : "";
 
     this.shadowRoot.innerHTML = `
       <style>${SHARED_STYLES}</style>
@@ -567,14 +607,15 @@ class PerceptiveRoomCard extends HTMLElement {
               <span>${roomName}</span>
             </div>
             <div class="subtitle">
-              <span>State: <b>${pState.toUpperCase()}</b></span>
+              <span>State: <b>${pState.toUpperCase()}</b> (${(attr.time_regime || "day").toUpperCase()})</span>
               <span>• Raw: ${attr.raw_lux} lx (Target ${attr.target_comfort_lux} lx)</span>
               <span>• Deficit: ${deficitPct}%</span>
+              ${tempBadge}
             </div>
           </div>
           <div class="badges-row">
             ${statusPillHtml}
-            <div class="pill-badge" id="btn-toggle-settings" title="Learned AI Weights, Window Compass & Area Exclusions">⚙️</div>
+            <div class="pill-badge" id="btn-toggle-settings" title="Competing Models, Sensor Floor Weights, Compass & Exclusions">⚙️</div>
           </div>
         </div>
 
