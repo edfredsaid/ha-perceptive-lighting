@@ -1,15 +1,16 @@
-"""Perceptive Lighting Custom Lovelace Cards (Room Card & Whole-Home Overview Card).
-
-Auto-registered by the custom_components/perceptive_lighting integration.
-Supports:
-- Visual GUI Editor (Pick a Room from a single dropdown)
-- Live Perceptive Comfort Gauge, Daylight vs Artificial breakdown, & Outdoor Sky Status
-- One-tap Adaptive Scene & Activity switching
-- Live "Capture Current Light Setup as Adaptive Scene" modal
-- Micro-step perceptual tuning: [ - Too Bright ] and [ + Needs More Light ]
-- Interactive "Point Phone at Window" Web Magnetometer Compass calibration
-- Live Area Entity Exclusion (Blacklist) drawer
-"""
+/**
+ * Perceptive Lighting Custom Lovelace Cards (Room Card & Whole-Home Overview Card).
+ *
+ * Auto-registered by the custom_components/perceptive_lighting integration.
+ * Supports:
+ * - Visual GUI Editor (Pick a Room from a single dropdown)
+ * - Live Perceptive Comfort Gauge, Daylight vs Artificial breakdown, & Outdoor Sky Status
+ * - One-tap Adaptive Scene & Activity switching
+ * - Live "Capture Current Light Setup as Adaptive Scene" modal
+ * - Micro-step perceptual tuning & Online ML + Gemini AI model optimization
+ * - Interactive "Point Phone at Window" Web Magnetometer Compass calibration
+ * - Live Area Entity Exclusion (Blacklist) drawer
+ */
 
 const DOMAIN = "perceptive_lighting";
 
@@ -510,8 +511,21 @@ class PerceptiveRoomCard extends HTMLElement {
         })
         .join("");
 
+      const lw = attr.learned_weights || {};
+      const actMults = lw.activity_target_multipliers || {};
+      const actMultVal = actMults[activeActivity] ?? 1.0;
+
       settingsDrawerHtml = `
         <div class="drawer">
+          <h4>🧠 Learned ML & Gemini AI Weights (${attr.observation_count || 0} observations)</h4>
+          <div style="color:var(--secondary-text-color);margin-bottom:8px;line-height:1.45;">
+            • Activity (${activeActivity}) Target Scale: <b>${actMultVal}x</b><br/>
+            • Outdoor Cave-Contrast Adaptation: <b>${lw.outdoor_adaptation_scale ?? 1.0}x</b><br/>
+            • Overcast / Diffuse Sky Boost: <b>${lw.diffuse_sky_sensitivity ?? 1.0}x</b><br/>
+            • Evening / Night Comfort Scale: <b>${lw.night_comfort_scale ?? 1.0}x</b><br/>
+            • Artificial Brightness Scale: <b>${lw.brightness_output_scale ?? 1.0}x</b>
+          </div>
+
           <h4>🧭 Window Compass Calibration</h4>
           <div style="color:var(--secondary-text-color);margin-bottom:6px;">
             Current window azimuth: <b>${compassDegreesToCardinal(attr.window_azimuth)}</b>
@@ -537,6 +551,13 @@ class PerceptiveRoomCard extends HTMLElement {
       `;
     }
 
+    const aiInsightHtml = attr.ai_insight
+      ? `<div style="margin:8px 0 4px 0;padding:8px 11px;border-radius:10px;background:rgba(99,102,241,0.12);border:1px solid rgba(99,102,241,0.28);font-size:0.78rem;color:var(--primary-text-color);display:flex;align-items:center;justify-content:space-between;gap:8px;">
+           <span>🧠 <b>AI Model:</b> ${attr.ai_insight}</span>
+           <span style="color:var(--secondary-text-color);white-space:nowrap;">${attr.observation_count || 0} obs</span>
+         </div>`
+      : "";
+
     this.shadowRoot.innerHTML = `
       <style>${SHARED_STYLES}</style>
       <ha-card>
@@ -553,7 +574,7 @@ class PerceptiveRoomCard extends HTMLElement {
           </div>
           <div class="badges-row">
             ${statusPillHtml}
-            <div class="pill-badge" id="btn-toggle-settings" title="Window Compass & Area Exclusions">⚙️</div>
+            <div class="pill-badge" id="btn-toggle-settings" title="Learned AI Weights, Window Compass & Area Exclusions">⚙️</div>
           </div>
         </div>
 
@@ -568,6 +589,8 @@ class PerceptiveRoomCard extends HTMLElement {
           </div>
         </div>
 
+        ${aiInsightHtml}
+
         <div class="scenes-grid">
           ${sceneChipsHtml}
         </div>
@@ -576,11 +599,12 @@ class PerceptiveRoomCard extends HTMLElement {
           showTuning
             ? `
           <div class="tune-row">
-            <div class="nudge-group">
+            <div class="nudge-group" style="flex-wrap:wrap;">
               <button class="btn-action" id="btn-nudge-darker" title="Nudge room target lower (-20% target lux)">🔉 Too Bright (-)</button>
               <button class="btn-action" id="btn-nudge-lighter" title="Nudge room target higher (+20% target lux)">🔆 Needs More Light (+)</button>
               <button class="btn-action" id="btn-feels-dark-now" title="One-tap teach: It feels dark right now (turn lights ON)">🌑 Feels Dark Now</button>
               <button class="btn-action" id="btn-feels-bright-now" title="One-tap teach: It feels bright enough right now (turn lights OFF)">☀️ Bright Enough Now</button>
+              <button class="btn-action" id="btn-ai-optimize" title="Ask Gemini / Home Assistant AI to analyze your adjustments and optimize this room's model">🧠 AI Optimize</button>
             </div>
             <button class="btn-action" id="btn-toggle-capture">📸 Capture Scene</button>
           </div>
@@ -654,6 +678,14 @@ class PerceptiveRoomCard extends HTMLElement {
     if (btnBrightNow) {
       btnBrightNow.addEventListener("click", () => {
         this._callService("calibrate_feels_bright_now", { room_id: roomId });
+      });
+    }
+
+    const btnAiOpt = this.shadowRoot.querySelector("#btn-ai-optimize");
+    if (btnAiOpt) {
+      btnAiOpt.addEventListener("click", () => {
+        btnAiOpt.textContent = "🧠 Optimizing...";
+        this._callService("optimize_with_ai", { room_id: roomId });
       });
     }
 

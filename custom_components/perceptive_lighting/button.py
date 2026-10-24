@@ -26,6 +26,7 @@ async def async_setup_entry(
                 RoomNudgeTooBrightButton(room),
                 RoomCalibrateFeelsDarkNowButton(room),
                 RoomCalibrateFeelsBrightNowButton(room),
+                RoomOptimizeWithGeminiButton(room),
             ]
         )
     async_add_entities(entities)
@@ -109,3 +110,18 @@ class RoomCalibrateFeelsBrightNowButton(BaseRoomButton):
 
     async def async_press(self) -> None:
         await self.room.async_calibrate_feels_bright_now()
+
+
+class RoomOptimizeWithGeminiButton(BaseRoomButton):
+    """On-demand AI optimization button: Calls Gemini / Home Assistant AI to analyze observation history and refine room weights."""
+
+    def __init__(self, room: RoomController) -> None:
+        super().__init__(
+            room,
+            "optimize_with_ai",
+            "AI: Optimize Room Model Now",
+            "mdi:brain",
+        )
+
+    async def async_press(self) -> None:
+        await self.room.async_optimize_with_gemini()

@@ -209,6 +209,11 @@ class RoomPerceptiveIlluminanceSensor(BaseRoomSensor):
             "sensor_profiles": {
                 k: v.to_dict() for k, v in self.room.sensor_profiles.items()
             },
+            "learned_weights": self.room.learned_weights.to_dict(),
+            "ai_insight": self.room.learned_weights.last_ai_insight,
+            "ai_last_optimized_utc": self.room.learned_weights.last_ai_optimized_utc,
+            "ai_total_optimizations": self.room.learned_weights.total_optimizations,
+            "observation_count": len(self.room.observations),
         }
 
 

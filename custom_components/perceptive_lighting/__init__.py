@@ -24,6 +24,7 @@ from .const import (
     SERVICE_DELETE_ADAPTIVE_SCENE,
     SERVICE_LOCK_ROOM,
     SERVICE_NUDGE_FEEL,
+    SERVICE_OPTIMIZE_WITH_AI,
     SERVICE_RELEARN_HISTORY,
     SERVICE_SET_WINDOW_COMPASS,
     SERVICE_UNLOCK_ROOM,
@@ -242,6 +243,18 @@ def _async_register_services(hass: HomeAssistant) -> None:
             if isinstance(val, PerceptiveLightingHub):
                 await val.async_run_historical_learning()
 
+    async def handle_optimize_with_ai(call: ServiceCall) -> None:
+        room_key = call.data.get("room_id")
+        if room_key:
+            room = _find_room(hass, room_key)
+            if room:
+                await room.async_optimize_with_gemini()
+        else:
+            for val in hass.data.get(DOMAIN, {}).values():
+                if isinstance(val, PerceptiveLightingHub):
+                    for room in val.rooms.values():
+                        await room.async_optimize_with_gemini()
+
     hass.services.async_register(
         DOMAIN,
         SERVICE_APPLY_ADAPTIVE_SCENE,
@@ -339,4 +352,10 @@ def _async_register_services(hass: HomeAssistant) -> None:
         SERVICE_RELEARN_HISTORY,
         handle_relearn_history,
         schema=vol.Schema({}),
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_OPTIMIZE_WITH_AI,
+        handle_optimize_with_ai,
+        schema=vol.Schema({vol.Optional("room_id"): str}),
     )

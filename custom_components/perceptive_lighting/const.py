@@ -5,7 +5,7 @@ from typing import Final
 
 DOMAIN: Final = "perceptive_lighting"
 NAME: Final = "Perceptive Lighting"
-VERSION: Final = "1.1.0"
+VERSION: Final = "1.2.0"
 
 # Static frontend URL for bundled custom Lovelace cards
 STATIC_URL_PATH: Final = "/perceptive_lighting_static"
@@ -231,3 +231,4 @@ SERVICE_CALIBRATE_FEELS_BRIGHT_NOW: Final = "calibrate_feels_bright_now"
 SERVICE_SET_WINDOW_COMPASS: Final = "set_window_compass"
 SERVICE_UPDATE_ROOM_EXCLUSIONS: Final = "update_room_exclusions"
 SERVICE_RELEARN_HISTORY: Final = "relearn_history"
+SERVICE_OPTIMIZE_WITH_AI: Final = "optimize_with_ai"

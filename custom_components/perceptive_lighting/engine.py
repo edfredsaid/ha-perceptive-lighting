@@ -288,6 +288,11 @@ def compute_room_perceptive_illuminance(
     artificial_lux_estimate: float = 0.0,
     feel_nudge_day_pct: float = 0.0,
     feel_nudge_night_pct: float = 0.0,
+    learned_activity_mult: float = 1.0,
+    learned_outdoor_adaptation_scale: float = 1.0,
+    learned_diffuse_sensitivity: float = 1.0,
+    learned_night_scale: float = 1.0,
+    learned_brightness_scale: float = 1.0,
 ) -> RoomPerceptiveResult:
     """Compute Perceptive Illuminance, Natural Perceptive Illuminance, and Deficit for a room."""
     activity = ACTIVITY_DEFINITIONS.get(activity_key, ACTIVITY_DEFINITIONS[ACTIVITY_RELAXING])
@@ -336,7 +341,7 @@ def compute_room_perceptive_illuminance(
         base_spatial_lux = artificial_lux_estimate
         internal_contrast = 1.0
 
-    # 2. Direct vs. Diffuse Sky Factor (MRSE modeling)
+    # 2. Direct vs. Diffuse Sky Factor (MRSE modeling + ML learned diffuse sensitivity)
     direct_sun = is_sun_in_room_window(
         sun_window_direction,
         window_azimuth,
@@ -354,7 +359,7 @@ def compute_room_perceptive_illuminance(
         diffuse_modifier = 0.82
     else:
         # Overcast/diffuse light wraps walls and ceiling evenly (high MRSE)
-        diffuse_modifier = outdoor.diffuse_sky_factor
+        diffuse_modifier = outdoor.diffuse_sky_factor * learned_diffuse_sensitivity
 
     effective_spatial_lux = max(0.0, base_spatial_lux * diffuse_modifier)
 
@@ -367,9 +372,11 @@ def compute_room_perceptive_illuminance(
     natural_spatial_lux = max(0.0, natural_raw_est * diffuse_modifier)
 
     # 3. Dynamic Comfort Target (E_target)
-    # Combines activity baseline + outdoor visual adaptation ("Cave Effect") + circadian + user micro-nudges
-    base_target = float(activity["base_lux"])
-    alpha = float(activity["adaptation_alpha"])
+    # Combines activity baseline + outdoor visual adaptation ("Cave Effect") + circadian + ML weights + user micro-nudges
+    base_target = float(activity["base_lux"]) * learned_activity_mult
+    if not outdoor.is_daytime:
+        base_target *= learned_night_scale
+    alpha = float(activity["adaptation_alpha"]) * learned_outdoor_adaptation_scale
     cave_weight = float(activity["cave_contrast_weight"])
 
     if daylight_level == DAYLIGHT_NONE or outdoor.effective_sky_lux <= 5.0:
@@ -440,13 +447,17 @@ def compute_room_perceptive_illuminance(
         state = STATE_DARK
 
     # 5. Recommended Brightness & Kruithof / Circadian Color Temperature (CCT)
-    # Apply Stevens' Power Law / Gamma correction so light output matches perceived deficit
+    # Apply Stevens' Power Law / Gamma correction + ML learned brightness scale
     if deficit_pct <= 3.0:
         rec_brightness = 0
     else:
         norm_def = deficit_pct / 100.0
-        # Perceptual gamma curve + activity brightness ceiling
-        scaled = math.pow(norm_def, 0.78) * float(activity["brightness_scale"])
+        # Perceptual gamma curve + activity brightness ceiling + ML brightness scale
+        scaled = (
+            math.pow(norm_def, 0.78)
+            * float(activity["brightness_scale"])
+            * learned_brightness_scale
+        )
         rec_brightness = int(clamp(round(scaled * 100.0), 8, 100))
 
     # Kruithof Curve + Solar Elevation CCT calculation:

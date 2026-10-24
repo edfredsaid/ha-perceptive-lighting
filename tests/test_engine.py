@@ -27,6 +27,11 @@ from perceptive_lighting.const import (  # noqa: E402
     SUN_DIR_COMPASS,
     SUN_DIR_NEVER,
 )
+from perceptive_lighting.ai_learner import (  # noqa: E402
+    LearnedRoomWeights,
+    PerceptiveObservation,
+    apply_online_sgd_step,
+)
 from perceptive_lighting.engine import (  # noqa: E402
     SensorLearnedProfile,
     compute_outdoor_environment,
@@ -226,6 +231,38 @@ class TestPerceptiveEngine(unittest.TestCase):
         self.assertGreater(res.internal_contrast_ratio, 3.0)
         # Geometric blend ensures the 600 lx window sensor doesn't trick the room into thinking the dark corner is 310 lx
         self.assertLess(res.effective_spatial_lux, 200.0)
+
+    def test_online_ml_contextual_sgd_learning(self) -> None:
+        """Verify that Online ML attributes user feedback to the specific active environmental features."""
+        weights = LearnedRoomWeights()
+        # Scenario 1: Bright overcast day (12,000 lx outside), 28 lx natural indoors.
+        # Model predicted 115 lx target (lights ON), but user presses "Feels Bright Enough Now (Turn Off)".
+        obs_bright = PerceptiveObservation(
+            timestamp_utc="2026-10-24T12:00:00Z",
+            event_type="feels_bright_now",
+            activity=ACTIVITY_RELAXING,
+            indoor_raw_lux=28.0,
+            natural_spatial_lux=28.0,
+            outdoor_sky_lux=12000.0,
+            cloud_cover_ratio=0.85,
+            diffuse_sky_factor=1.18,
+            solar_elevation=32.0,
+            solar_azimuth=175.0,
+            is_daytime=True,
+            model_target_lux=115.0,
+            model_deficit_pct=55.0,
+            model_recommended_bri_pct=65,
+            user_desired_lights_on=False,
+            user_desired_bri_pct=0,
+        )
+        apply_online_sgd_step(weights, obs_bright)
+
+        # Because outdoor sky was bright and overcast when user said "bright enough",
+        # Online ML should reduce outdoor_adaptation_scale, reduce relaxing activity multiplier,
+        # and boost diffuse_sky_sensitivity!
+        self.assertLess(weights.get_activity_multiplier(ACTIVITY_RELAXING), 1.0)
+        self.assertLess(weights.outdoor_adaptation_scale, 1.0)
+        self.assertGreater(weights.diffuse_sky_sensitivity, 1.0)
 
 
 if __name__ == "__main__":

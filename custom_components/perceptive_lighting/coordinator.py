@@ -72,6 +72,13 @@ from .const import (
     SUN_DIR_AUTO,
     SUN_DIR_COMPASS,
 )
+from .ai_learner import (
+    MAX_OBSERVATION_HISTORY,
+    LearnedRoomWeights,
+    PerceptiveObservation,
+    apply_online_sgd_step,
+    async_run_gemini_room_optimization,
+)
 from .engine import (
     OutdoorEnvironmentState,
     RoomPerceptiveResult,
@@ -161,7 +168,7 @@ class RoomController:
                     entity_id=eid, placement=pdata
                 )
 
-        # Persisted runtime state (nudges, lock, captured scenes, learned light lux)
+        # Persisted runtime state (nudges, lock, captured scenes, learned ML weights, observations)
         pstate = persisted_state or {}
         self.automation_locked: bool = bool(pstate.get("automation_locked", False))
         self.feel_nudge_day_pct: float = float(pstate.get("feel_nudge_day_pct", 0.0))
@@ -179,6 +186,15 @@ class RoomController:
         self.max_artificial_lux: float = float(
             pstate.get("max_artificial_lux", 110.0)
         )
+        self.learned_weights: LearnedRoomWeights = LearnedRoomWeights.from_dict(
+            pstate.get("learned_weights", {})
+        )
+        self.observations: list[PerceptiveObservation] = [
+            PerceptiveObservation.from_dict(o)
+            for o in pstate.get("observations", [])
+            if isinstance(o, dict)
+        ][-MAX_OBSERVATION_HISTORY:]
+        self._obs_since_last_gemini_call: int = 0
 
         # Adaptive scenes (built-in activity scenes + linked HA scenes + user captured scenes)
         self.adaptive_scenes: dict[str, AdaptiveSceneSpec] = {}
@@ -232,6 +248,10 @@ class RoomController:
             "active_activity": self.active_activity,
             "active_scene_id": self.active_scene_id,
             "max_artificial_lux": round(self.max_artificial_lux, 1),
+            "learned_weights": self.learned_weights.to_dict(),
+            "observations": [
+                o.to_dict() for o in self.observations[-MAX_OBSERVATION_HISTORY:]
+            ],
             "adaptive_scenes": {
                 k: v.to_dict() for k, v in self.adaptive_scenes.items()
             },
@@ -458,6 +478,13 @@ class RoomController:
             artificial_lux_estimate=artificial_lux_est,
             feel_nudge_day_pct=self.feel_nudge_day_pct,
             feel_nudge_night_pct=self.feel_nudge_night_pct,
+            learned_activity_mult=self.learned_weights.get_activity_multiplier(
+                self.active_activity
+            ),
+            learned_outdoor_adaptation_scale=self.learned_weights.outdoor_adaptation_scale,
+            learned_diffuse_sensitivity=self.learned_weights.diffuse_sky_sensitivity,
+            learned_night_scale=self.learned_weights.night_comfort_scale,
+            learned_brightness_scale=self.learned_weights.brightness_output_scale,
         )
 
         # 5. Evaluate occupancy (presence sensors + optional media players)
@@ -865,7 +892,7 @@ class RoomController:
 
         if state_changed or bri_changed:
             _LOGGER.debug(
-                "[%s] Manual light change detected on %s; engaging Manual Override.",
+                "[%s] Manual light change detected on %s; engaging Manual Override & Online ML.",
                 self.room_name,
                 new_state.entity_id,
             )
@@ -873,9 +900,83 @@ class RoomController:
             self.manual_override_baseline_natural_pct = (
                 self.result.natural_perceptive_illuminance_pct
             )
+
+            # Record observation for Online ML & Gemini AI learning
+            is_now_on = new_state.state == STATE_ON
+            bri_pct = (
+                int(round(float(new_bri) * 100.0 / 255.0))
+                if (is_now_on and new_bri is not None)
+                else (80 if is_now_on else 0)
+            )
+            ev_type = (
+                "manual_light_off"
+                if not is_now_on
+                else ("manual_light_on" if old_state.state == STATE_OFF else "manual_dim")
+            )
+            self._record_observation_and_learn(
+                event_type=ev_type,
+                desired_lights_on=is_now_on,
+                desired_bri_pct=bri_pct,
+            )
+
             async_dispatcher_send(
                 self.hass, f"{SIGNAL_ROOM_UPDATED}_{self.room_id}"
             )
+
+    @callback
+    def _record_observation_and_learn(
+        self,
+        event_type: str,
+        desired_lights_on: bool,
+        desired_bri_pct: int,
+    ) -> None:
+        """Record a user interaction observation, run immediate Online ML SGD, and schedule Gemini AI optimization."""
+        out = self.hub.outdoor_state
+        obs = PerceptiveObservation(
+            timestamp_utc=datetime.now(timezone.utc).isoformat(),
+            event_type=event_type,
+            activity=self.active_activity,
+            indoor_raw_lux=self.result.raw_lux,
+            natural_spatial_lux=self.result.natural_spatial_lux,
+            outdoor_sky_lux=out.effective_sky_lux,
+            cloud_cover_ratio=out.cloud_cover_ratio,
+            diffuse_sky_factor=out.diffuse_sky_factor,
+            solar_elevation=out.solar_elevation,
+            solar_azimuth=out.solar_azimuth,
+            is_daytime=out.is_daytime,
+            model_target_lux=self.result.target_comfort_lux,
+            model_deficit_pct=self.result.lighting_deficit_pct,
+            model_recommended_bri_pct=self.result.recommended_brightness_pct,
+            user_desired_lights_on=desired_lights_on,
+            user_desired_bri_pct=desired_bri_pct,
+        )
+        self.observations.append(obs)
+        if len(self.observations) > MAX_OBSERVATION_HISTORY:
+            self.observations = self.observations[-MAX_OBSERVATION_HISTORY:]
+
+        # 1. Immediate local Online ML contextual weight update
+        apply_online_sgd_step(self.learned_weights, obs)
+
+        # 2. Every 3 observations, trigger background Gemini AI optimization to synthesize patterns
+        self._obs_since_last_gemini_call += 1
+        if self._obs_since_last_gemini_call >= 3:
+            self._obs_since_last_gemini_call = 0
+            self.hass.async_create_task(self.async_optimize_with_gemini())
+
+    async def async_optimize_with_gemini(self) -> bool:
+        """Invoke Home Assistant's Gemini AI (`ai_task` / `conversation`) to refine room weights from observation history."""
+        ok = await async_run_gemini_room_optimization(
+            hass=self.hass,
+            room_name=self.room_name,
+            room_config=self.config,
+            weights=self.learned_weights,
+            observations=self.observations,
+            current_outdoor=self.hub.outdoor_state,
+            current_result=self.result,
+        )
+        self.async_evaluate_room(self.hub.outdoor_state, trigger_control=False)
+        await self.hub.async_save_runtime_state()
+        return ok
 
     # --- User Actions & Calibration Methods ---
 
@@ -937,14 +1038,20 @@ class RoomController:
         return spec
 
     async def async_nudge_feel(
-        self, direction: str, step_pct: float = DEFAULT_MICRO_NUDGE_STEP_PCT
+        self,
+        direction: str,
+        step_pct: float = DEFAULT_MICRO_NUDGE_STEP_PCT,
+        record_ml: bool = True,
     ) -> None:
         """Nudge the room's perceptual target lighter (+more light) or darker (-too bright) and immediately apply."""
-        delta = (
-            abs(step_pct)
-            if direction in ("lighter", "more_light", "darker_room", "up", "+")
-            else -abs(step_pct)
+        wants_more_light = direction in (
+            "lighter",
+            "more_light",
+            "darker_room",
+            "up",
+            "+",
         )
+        delta = abs(step_pct) if wants_more_light else -abs(step_pct)
         if self.hub.outdoor_state.is_daytime:
             self.feel_nudge_day_pct = clamp(
                 self.feel_nudge_day_pct + delta, -120.0, 120.0
@@ -952,6 +1059,13 @@ class RoomController:
         else:
             self.feel_nudge_night_pct = clamp(
                 self.feel_nudge_night_pct + delta, -120.0, 120.0
+            )
+
+        if record_ml:
+            self._record_observation_and_learn(
+                event_type="nudge_lighter" if wants_more_light else "nudge_darker",
+                desired_lights_on=wants_more_light or self.controlled_lights_are_on,
+                desired_bri_pct=min(100, self.result.recommended_brightness_pct + (15 if wants_more_light else -15)),
             )
 
         # Active calibration bypasses manual override and 10-minute anti-flicker cooldown!
@@ -966,24 +1080,40 @@ class RoomController:
 
     async def async_calibrate_feels_dark_now(self) -> None:
         """One-tap teaching calibration: adjust target so current natural lux registers as dark/needing light and turns lights ON."""
-        # Calculate exact nudge needed so target_comfort_lux is at least 2.5x natural_spatial_lux
+        self._record_observation_and_learn(
+            event_type="feels_dark_now",
+            desired_lights_on=True,
+            desired_bri_pct=max(50, self.result.recommended_brightness_pct),
+        )
+        # Re-evaluate with the updated Online ML weights first
+        self.async_evaluate_room(self.hub.outdoor_state, trigger_control=False)
         nat_lux = max(1.0, self.result.natural_spatial_lux)
-        desired_target = max(self.result.target_comfort_lux * 1.45, nat_lux * 2.5, 35.0)
+        desired_target = max(self.result.target_comfort_lux * 1.35, nat_lux * 2.2, 30.0)
         ratio = desired_target / max(1.0, self.result.target_comfort_lux)
-        needed_step = max(10.0, 32.0 * math.log2(max(1.15, ratio)))
-        await self.async_nudge_feel("more_light", step_pct=clamp(needed_step, 10.0, 64.0))
+        needed_step = max(8.0, 32.0 * math.log2(max(1.10, ratio)))
+        await self.async_nudge_feel(
+            "more_light", step_pct=clamp(needed_step, 8.0, 56.0), record_ml=False
+        )
 
     async def async_calibrate_feels_bright_now(self) -> None:
         """One-tap teaching calibration: room feels bright enough without lights right now -> lower target and turn lights OFF."""
-        # Lower target_comfort_lux below natural_spatial_lux so deficit drops to 0% and lights turn OFF immediately
+        self._record_observation_and_learn(
+            event_type="feels_bright_now",
+            desired_lights_on=False,
+            desired_bri_pct=0,
+        )
+        # Re-evaluate with the updated Online ML weights first
+        self.async_evaluate_room(self.hub.outdoor_state, trigger_control=False)
         nat_lux = max(2.0, self.result.natural_spatial_lux)
         desired_target = max(2.0, nat_lux * 0.65)
         ratio = desired_target / max(2.0, self.result.target_comfort_lux)
         if ratio < 1.0:
-            needed_step = max(12.0, abs(32.0 * math.log2(max(0.05, ratio))))
+            needed_step = max(8.0, abs(32.0 * math.log2(max(0.05, ratio))))
         else:
-            needed_step = 16.0
-        await self.async_nudge_feel("too_bright", step_pct=clamp(needed_step, 12.0, 96.0))
+            needed_step = 12.0
+        await self.async_nudge_feel(
+            "too_bright", step_pct=clamp(needed_step, 8.0, 88.0), record_ml=False
+        )
         # Ensure room lights turn off immediately when user says it's bright enough now
         if self.controlled_lights_are_on:
             await self._async_turn_off_room_lights(transition=3)
@@ -1087,6 +1217,13 @@ class PerceptiveLightingHub:
                 self.hass,
                 self._async_periodic_tick,
                 timedelta(seconds=60),
+            )
+        )
+        self._unsub_listeners.append(
+            async_track_time_interval(
+                self.hass,
+                self._async_periodic_ai_optimization,
+                timedelta(hours=6),
             )
         )
 
@@ -1225,3 +1362,9 @@ class PerceptiveLightingHub:
         for room in self.rooms.values():
             room.async_discover_area_entities()
         self.async_update_outdoor_and_rooms(trigger_control=True)
+
+    async def _async_periodic_ai_optimization(self, _now: datetime) -> None:
+        """Periodic 6-hour background check to run Gemini AI model synthesis for rooms with observations."""
+        for room in self.rooms.values():
+            if room.observations:
+                await room.async_optimize_with_gemini()

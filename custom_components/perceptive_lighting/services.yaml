@@ -177,3 +177,15 @@ update_room_exclusions:
 relearn_history:
   name: Re-Learn Sensor Profiles from Recorder History
   description: Re-analyze the past 10 days of Home Assistant Recorder history for all outdoor and indoor illuminance sensors.
+
+optimize_with_ai:
+  name: "AI: Optimize Room Perceptual Model (Gemini / HA AI)"
+  description: Analyze recorded user manual adjustments, calibration presses, and weather/sun telemetry using Home Assistant's AI Task / Gemini integration (with local ML fallback) to refine multi-dimensional room perceptual weights.
+  fields:
+    room_id:
+      name: Room ID or Name (Optional)
+      description: Leave empty to optimize all configured rooms, or specify a room (e.g., living_room).
+      required: false
+      example: "living_room"
+      selector:
+        text:
