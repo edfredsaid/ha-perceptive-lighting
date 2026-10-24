@@ -5,7 +5,7 @@ from typing import Final
 
 DOMAIN: Final = "perceptive_lighting"
 NAME: Final = "Perceptive Lighting"
-VERSION: Final = "2.0.2"
+VERSION: Final = "2.0.3"
 
 # Static frontend URL for bundled custom Lovelace cards & Sidebar Panel
 STATIC_URL_PATH: Final = "/perceptive_lighting_static"
