@@ -828,23 +828,23 @@ def compute_room_perceptive_illuminance(
     eff_min_art_lux = max(4.0, min_artificial_lux)
 
     # Rule A: When should lights turn ON (from OFF)?
-    # Only turn lights ON if the lux deficit is at least as large as the minimum artificial light
-    # our dimmest setting adds (or 18% of target_comfort_lux) AND perceptual deficit >= 16%.
+    # Only turn lights ON if the lux deficit is at least 75% of the minimum artificial light
+    # our dimmest setting adds (and >= 18% of target_comfort_lux) AND perceptual deficit >= 16%.
     min_turn_on_lux_deficit = max(
-        min(eff_min_art_lux * 0.85, target_comfort_lux * 0.45),
+        eff_min_art_lux * 0.75,
         target_comfort_lux * 0.18,
     )
     should_turn_on = (lux_deficit >= min_turn_on_lux_deficit) and (deficit_pct >= 16.0)
 
     # Rule B: When should lights turn OFF while the room is OCCUPIED?
-    # Turn lights OFF while occupied as soon as Natural Daylight Alone reaches comfort (or when
-    # the remaining lux deficit is smaller than 55% of the minimum artificial light quantum,
-    # meaning keeping electric lights on even at minimum dimness over-lights the room).
-    min_keep_on_lux_deficit = min(eff_min_art_lux * 0.55, target_comfort_lux * 0.15)
+    # Turn lights OFF while occupied as soon as Natural Daylight Alone reaches comfort OR when
+    # the remaining lux deficit is smaller than 70% of the minimum artificial light quantum
+    # (meaning keeping electric lights on even at minimum dimness over-lights the room).
+    min_keep_on_lux_deficit = eff_min_art_lux * 0.70
     should_turn_off_occupied = (
-        (natural_spatial_lux >= target_comfort_lux * 1.02)
+        (natural_spatial_lux >= target_comfort_lux * 0.98)
         or (lux_deficit <= min_keep_on_lux_deficit)
-        or (deficit_pct <= 6.0)
+        or (deficit_pct <= 8.0)
     )
 
     # Classify Perceptive State
@@ -858,19 +858,28 @@ def compute_room_perceptive_illuminance(
         state = STATE_DARK
 
     # 7. Recommended Brightness & Kruithof / Circadian Color Temperature (CCT)
-    if deficit_pct <= 4.0 or should_turn_off_occupied:
+    if deficit_pct <= 8.0 or should_turn_off_occupied:
         rec_brightness = 0
     else:
         norm_def = deficit_pct / 100.0
+        # Physical lux factor ensures lowering/raising target_comfort_lux always scales brightness
+        # even when natural_spatial_lux is near 0 lx (where deficit_pct stays near 100%).
+        lux_factor = clamp(math.pow(lux_deficit / 75.0, 0.70), 0.0, 1.35)
         scaled = (
-            math.pow(norm_def, 0.78)
+            math.pow(norm_def, 0.75)
+            * lux_factor
             * float(activity["brightness_scale"])
             * learned_brightness_scale
         )
         # In overnight regime, cap automatic brightness softly unless bright_task is selected
         if regime == REGIME_OVERNIGHT and activity_key != "bright_task":
             scaled = min(scaled, 0.25)
-        rec_brightness = int(clamp(round(scaled * 100.0), 8, 100))
+        raw_bri = int(round(scaled * 100.0))
+        if raw_bri < 8:
+            should_turn_off_occupied = True
+            rec_brightness = 0
+        else:
+            rec_brightness = int(clamp(raw_bri, 8, 100))
 
     min_cct = int(activity["min_cct"])
     max_cct = int(activity["max_cct"])

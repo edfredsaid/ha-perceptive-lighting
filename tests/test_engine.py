@@ -364,6 +364,90 @@ class TestPerceptiveEngine(unittest.TestCase):
         self.assertFalse(res_small_def.should_turn_lights_on)
         self.assertTrue(res_small_def.should_turn_lights_off_while_occupied)
 
+    def test_nudge_darker_dims_and_turns_off_in_utility_room(self) -> None:
+        """Verify that pressing 'Feel: Too Bright (-)' in a dim room (like Utility) lowers brightness & turns lights off."""
+        outdoor = compute_outdoor_environment(
+            sensor_readings={"sensor.outdoor_lux": 2500.0},
+            sensor_profiles={},
+            weather_condition="rainy",
+            weather_cloud_coverage=95.0,
+            solar_elevation=18.0,
+            solar_azimuth=190.0,
+            local_hour=15.0,
+        )
+        weights = LearnedRoomWeights()
+        res_base = compute_room_perceptive_illuminance(
+            indoor_sensor_readings={"sensor.utility_lux": 23.0},
+            sensor_profiles={},
+            outdoor=outdoor,
+            activity_key="transit",
+            artificial_lux_estimate=18.0,
+            lights_are_on=True,
+            feel_nudge_day_pct=0.0,
+            learned_activity_mult=weights.get_activity_multiplier("transit"),
+            learned_brightness_scale=weights.brightness_output_scale,
+        )
+        # Now simulate pressing 'Feel: Too Bright (-)' (nudge_darker) while lights are ON
+        obs = PerceptiveObservation(
+            timestamp_utc="2026-10-24T14:15:00Z",
+            event_type="nudge_darker",
+            time_regime="day",
+            activity="transit",
+            indoor_raw_lux=23.0,
+            natural_spatial_lux=res_base.natural_spatial_lux,
+            outdoor_sky_lux=2500.0,
+            weather_condition="rainy",
+            cloud_cover_ratio=0.95,
+            diffuse_sky_factor=1.18,
+            solar_elevation=18.0,
+            solar_azimuth=190.0,
+            is_daytime=True,
+            outdoor_temp_c=11.0,
+            indoor_temp_c=19.5,
+            indoor_humidity_pct=55.0,
+            day_length_hours=10.2,
+            direct_sun_in_window=False,
+            internal_contrast_ratio=1.0,
+            model_target_lux=res_base.target_comfort_lux,
+            model_deficit_pct=res_base.lighting_deficit_pct,
+            model_recommended_bri_pct=res_base.recommended_brightness_pct,
+            user_desired_lights_on=True,
+            user_desired_bri_pct=max(0, res_base.recommended_brightness_pct - 16),
+        )
+        apply_online_sgd_step(weights, obs)
+
+        # Verify that nudge_darker DECREASED activity multiplier & brightness_output_scale (not increased!)
+        self.assertLess(weights.get_activity_multiplier("transit"), 1.0)
+        self.assertLess(weights.brightness_output_scale, 1.0)
+
+        res_after_1 = compute_room_perceptive_illuminance(
+            indoor_sensor_readings={"sensor.utility_lux": 23.0},
+            sensor_profiles={},
+            outdoor=outdoor,
+            activity_key="transit",
+            artificial_lux_estimate=18.0,
+            lights_are_on=True,
+            feel_nudge_day_pct=-8.0,
+            learned_activity_mult=weights.get_activity_multiplier("transit"),
+            learned_brightness_scale=weights.brightness_output_scale,
+        )
+        self.assertLess(res_after_1.recommended_brightness_pct, res_base.recommended_brightness_pct)
+
+        # And when nudged far enough down, should_turn_lights_off_while_occupied becomes True!
+        res_off = compute_room_perceptive_illuminance(
+            indoor_sensor_readings={"sensor.utility_lux": 23.0},
+            sensor_profiles={},
+            outdoor=outdoor,
+            activity_key="transit",
+            artificial_lux_estimate=18.0,
+            lights_are_on=True,
+            feel_nudge_day_pct=-80.0,
+            learned_activity_mult=weights.get_activity_multiplier("transit"),
+            learned_brightness_scale=weights.brightness_output_scale,
+        )
+        self.assertTrue(res_off.should_turn_lights_off_while_occupied)
+        self.assertEqual(res_off.recommended_brightness_pct, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

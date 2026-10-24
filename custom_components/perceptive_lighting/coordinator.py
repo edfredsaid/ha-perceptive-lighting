@@ -207,6 +207,17 @@ class RoomController:
             for o in pstate.get("observations", [])
             if isinstance(o, dict)
         ][-MAX_OBSERVATION_HISTORY:]
+
+        # One-time v1.3.1 cleanup of corrupted manual_dim Zigbee transition echoes & inverted nudge weights
+        if not pstate.get("schema_v131_cleaned"):
+            self.feel_nudge_day_pct = 0.0
+            self.feel_nudge_night_pct = 0.0
+            self.learned_weights.activity_target_multipliers = {}
+            self.learned_weights.brightness_output_scale = 1.0
+            self.observations = [
+                o for o in self.observations if o.event_type != "manual_dim"
+            ]
+
         self._obs_since_last_gemini_call: int = 0
 
         # Adaptive scenes (built-in activity scenes + linked HA scenes + user captured scenes)
@@ -230,6 +241,7 @@ class RoomController:
         self.controlled_lights_are_on: bool = False
         self.pre_light_natural_lux: float | None = None
         self._recent_context_ids: set[str] = set()
+        self._ignore_light_events_until_utc: datetime | None = None
 
     @property
     def excluded_entities(self) -> set[str]:
@@ -254,6 +266,7 @@ class RoomController:
     def to_persisted_dict(self) -> dict[str, Any]:
         """Serialize runtime state for persistent storage."""
         return {
+            "schema_v131_cleaned": True,
             "automation_locked": self.automation_locked,
             "feel_nudge_day_pct": round(self.feel_nudge_day_pct, 2),
             "feel_nudge_night_pct": round(self.feel_nudge_night_pct, 2),
@@ -370,6 +383,13 @@ class RoomController:
                 "occupancy",
                 "presence",
             ):
+                # Exclude Aqara/Lumi PIR 10-minute synthetic ZHA occupancy cluster when fast PIR motion exists
+                if (
+                    "lumi" in eid_low
+                    and "sensor_motion" in eid_low
+                    and "occupancy" in eid_low
+                ):
+                    continue
                 pres_list.append(eid)
             elif domain == "media_player":
                 media_list.append(eid)
@@ -383,6 +403,22 @@ class RoomController:
                 ):
                     continue
                 light_list.append(eid)
+
+        # Deduplicate Light Group wrapper entities (e.g., light.all_lights_*) if their member lights are in the Area
+        light_set = set(light_list)
+        deduped_lights: list[str] = []
+        for leid in light_list:
+            lst = self.hass.states.get(leid)
+            members = lst.attributes.get("entity_id") if lst else None
+            if (
+                isinstance(members, (list, tuple))
+                and len(members) > 0
+                and any(m in light_set and m != leid for m in members)
+            ):
+                continue
+            deduped_lights.append(leid)
+        if deduped_lights:
+            light_list = deduped_lights
 
         self.all_area_entities = {
             "illuminance_sensors": sorted(lux_list),
@@ -498,11 +534,22 @@ class RoomController:
                 active_brightness_ratios.append(ratio)
 
         self.controlled_lights_are_on = any_light_on
+        if not any_light_on and current_readings:
+            self.pre_light_natural_lux = sum(current_readings.values()) / len(
+                current_readings
+            )
+
         if any_light_on and active_brightness_ratios:
             avg_bri_ratio = sum(active_brightness_ratios) / len(self.lights)
             # Non-linear lumen output bounded below by min_artificial_lux
             span = max(0.0, self.max_artificial_lux - self.min_artificial_lux)
             artificial_lux_est = self.min_artificial_lux + span * math.pow(avg_bri_ratio, 1.4)
+            if self.pre_light_natural_lux is not None and current_readings:
+                raw_avg = sum(current_readings.values()) / len(current_readings)
+                artificial_lux_est = min(
+                    artificial_lux_est,
+                    max(0.0, raw_avg - self.pre_light_natural_lux * 0.85),
+                )
         else:
             artificial_lux_est = 0.0
 
@@ -573,27 +620,30 @@ class RoomController:
         self.is_occupied = self._compute_occupancy()
 
         # 6. Check Manual Override reset conditions:
-        #    Resets if room becomes unoccupied OR if a substantial shift in natural illuminance occurs
-        if self.manual_override_active:
-            if not self.is_occupied and was_occupied:
+        #    Always clear manual override whenever room is unoccupied OR when a substantial shift in natural illuminance occurs
+        if not self.is_occupied:
+            if self.manual_override_active:
                 _LOGGER.debug(
-                    "[%s] Room vacated; clearing manual override.", self.room_name
+                    "[%s] Room unoccupied; clearing manual override.", self.room_name
                 )
                 self.manual_override_active = False
                 self.manual_override_baseline_natural_pct = None
-            elif self.manual_override_baseline_natural_pct is not None:
-                shift = abs(
-                    self.result.natural_perceptive_illuminance_pct
-                    - self.manual_override_baseline_natural_pct
+        elif (
+            self.manual_override_active
+            and self.manual_override_baseline_natural_pct is not None
+        ):
+            shift = abs(
+                self.result.natural_perceptive_illuminance_pct
+                - self.manual_override_baseline_natural_pct
+            )
+            if shift >= DEFAULT_SUBSTANTIAL_LUX_SHIFT_PCT:
+                _LOGGER.debug(
+                    "[%s] Substantial natural illuminance shift (%.1f%%); clearing manual override.",
+                    self.room_name,
+                    shift,
                 )
-                if shift >= DEFAULT_SUBSTANTIAL_LUX_SHIFT_PCT:
-                    _LOGGER.debug(
-                        "[%s] Substantial natural illuminance shift (%.1f%%); clearing manual override.",
-                        self.room_name,
-                        shift,
-                    )
-                    self.manual_override_active = False
-                    self.manual_override_baseline_natural_pct = None
+                self.manual_override_active = False
+                self.manual_override_baseline_natural_pct = None
 
         # Notify entities and custom Lovelace cards
         async_dispatcher_send(
@@ -643,6 +693,16 @@ class RoomController:
                 return True
         return False
 
+    def _get_current_on_brightness_pct(self) -> int:
+        """Return current average brightness percentage (1-100) of ON lights in the room, or 0 if all OFF."""
+        vals: list[float] = []
+        for leid in self.lights:
+            st = self.hass.states.get(leid)
+            if st and st.state == STATE_ON:
+                bri = st.attributes.get("brightness")
+                vals.append((float(bri) * 100.0 / 255.0) if bri is not None else 80.0)
+        return int(round(sum(vals) / len(vals))) if vals else 0
+
     async def _async_run_lighting_controller(
         self, occupancy_just_changed: bool = False, force_apply: bool = False
     ) -> None:
@@ -655,16 +715,20 @@ class RoomController:
             or self._is_blocked_by_inhibit_entity()
         ):
             return
-        if self.manual_override_active and not force_apply:
-            return
 
         now = datetime.now(timezone.utc)
 
-        # Case 1: Room is unoccupied -> Turn off controlled lights
+        # Case 1: Room is unoccupied -> Always turn off controlled lights immediately!
+        #         Timers (cooldown_active / adjust_interval) and manual_override ONLY apply when occupied!
         if not self.is_occupied and not force_apply:
+            self.manual_override_active = False
+            self.manual_override_baseline_natural_pct = None
             if self.controlled_lights_are_on:
-                await self._async_turn_off_room_lights()
-                self.last_on_off_change_utc = now
+                await self._async_turn_off_room_lights(transition=3)
+                self.controlled_lights_are_on = False
+            return
+
+        if self.manual_override_active and not force_apply:
             return
 
         # Case 2: Room is occupied (or force_apply from scene selector / calibration)
@@ -694,7 +758,8 @@ class RoomController:
             if wants_lights_off:
                 if self.cooldown_active and not force_apply:
                     return
-                await self._async_turn_off_room_lights(transition=3 if force_apply else 20)
+                await self._async_turn_off_room_lights(transition=3 if force_apply else 15)
+                self.controlled_lights_are_on = False
                 self.last_on_off_change_utc = now
                 return
 
@@ -761,7 +826,7 @@ class RoomController:
             min_def = float(grp.get("min_deficit_pct", 15.0))
             weight = float(grp.get("brightness_weight", 1.0))
 
-            if deficit < min_def:
+            if deficit < min_def and target_brightness_pct <= 0:
                 # Turn off this tier if it's currently on
                 on_ents = [
                     e
@@ -794,8 +859,9 @@ class RoomController:
         """Apply an Adaptive Scene scaled dynamically to the current lighting deficit."""
         deficit = max(15.0, self.result.lighting_deficit_pct)
         ref_def = max(15.0, spec.reference_deficit_pct)
-        # Scale ratio relative to the deficit when the scene was calibrated
-        scale_ratio = clamp(math.pow(deficit / ref_def, 0.75), 0.25, 1.65)
+        # Scale ratio relative to the deficit when the scene was calibrated, modulated by target_brightness_pct
+        bri_mod = clamp(target_brightness_pct / 60.0, 0.25, 1.65)
+        scale_ratio = clamp(math.pow(deficit / ref_def, 0.65) * bri_mod, 0.15, 1.65)
 
         if spec.light_states:
             to_turn_off: list[str] = []
@@ -830,6 +896,9 @@ class RoomController:
         # Activate the HA scene, then capture its light ratios and scale brightness!
         if spec.linked_ha_scene_entity:
             ctx = self._make_context()
+            self._ignore_light_events_until_utc = datetime.now(timezone.utc) + timedelta(
+                seconds=max(5.0, float(min(transition, 5)) + 3.0)
+            )
             await self.hass.services.async_call(
                 "scene",
                 "turn_on",
@@ -899,10 +968,14 @@ class RoomController:
     async def _async_call_light_service(
         self, action: str, entity_ids: list[str], data: dict[str, Any]
     ) -> None:
-        """Call light.turn_on or light.turn_off with tracked context ID to avoid false manual override."""
+        """Call light.turn_on or light.turn_off with tracked context ID & transition guard to avoid false manual override."""
         if not entity_ids:
             return
         ctx = self._make_context()
+        trans_sec = float(data.get("transition", 2))
+        self._ignore_light_events_until_utc = datetime.now(timezone.utc) + timedelta(
+            seconds=max(4.0, trans_sec + 3.0)
+        )
         service = "turn_on" if action == STATE_ON else "turn_off"
         payload = {ATTR_ENTITY_ID: entity_ids}
         # Only pass transition/brightness to lights that support it
@@ -940,6 +1013,8 @@ class RoomController:
         """Detect manual light adjustments (wall switch, remote, dashboard) to engage soft Manual Override."""
         if self.operating_mode == MODE_SENSOR_ONLY or self.automation_locked:
             return
+        if not self.is_occupied:
+            return
 
         new_state = event.data.get("new_state")
         old_state = event.data.get("old_state")
@@ -950,11 +1025,16 @@ class RoomController:
         if old_state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
             return
 
-        # Ignore our own automated service calls!
+        # Ignore our own automated service calls and Zigbee transition ramp echoes!
         ctx = event.context
         if (
             ctx.id in self._recent_context_ids
             or ctx.parent_id in self._recent_context_ids
+        ):
+            return
+        if (
+            self._ignore_light_events_until_utc is not None
+            and datetime.now(timezone.utc) < self._ignore_light_events_until_utc
         ):
             return
 
@@ -965,7 +1045,7 @@ class RoomController:
         bri_changed = (
             old_bri is not None
             and new_bri is not None
-            and abs(int(old_bri) - int(new_bri)) > 8
+            and abs(int(old_bri) - int(new_bri)) > 12
         )
 
         if state_changed or bri_changed:
@@ -1140,7 +1220,7 @@ class RoomController:
         step_pct: float = DEFAULT_MICRO_NUDGE_STEP_PCT,
         record_ml: bool = True,
     ) -> None:
-        """Nudge the room's perceptual target lighter (+more light) or darker (-too bright) and immediately apply."""
+        """Nudge the room's perceptual target & brightness lighter (+more light) or darker (-too bright) and immediately apply."""
         wants_more_light = direction in (
             "lighter",
             "more_light",
@@ -1148,21 +1228,45 @@ class RoomController:
             "up",
             "+",
         )
+        current_on_bri = self._get_current_on_brightness_pct()
+        lights_currently_on = current_on_bri > 0
+
         delta = abs(step_pct) if wants_more_light else -abs(step_pct)
         if self.hub.outdoor_state.is_daytime:
             self.feel_nudge_day_pct = clamp(
-                self.feel_nudge_day_pct + delta, -120.0, 120.0
+                self.feel_nudge_day_pct + delta, -160.0, 160.0
             )
         else:
             self.feel_nudge_night_pct = clamp(
-                self.feel_nudge_night_pct + delta, -120.0, 120.0
+                self.feel_nudge_night_pct + delta, -160.0, 160.0
             )
+
+        # If an Adaptive Scene is active, also nudge its reference deficit so the scene scales immediately
+        active_spec = self.adaptive_scenes.get(self.active_scene_id)
+        if active_spec is not None:
+            active_spec.reference_deficit_pct = clamp(
+                active_spec.reference_deficit_pct * (0.82 if wants_more_light else 1.22),
+                15.0,
+                160.0,
+            )
+
+        if wants_more_light:
+            desired_lights_on = True
+            base_bri = current_on_bri if lights_currently_on else self.result.recommended_brightness_pct
+            desired_bri_pct = min(100, max(25, base_bri + 16))
+        else:
+            if not lights_currently_on or current_on_bri <= 18:
+                desired_lights_on = False
+                desired_bri_pct = 0
+            else:
+                desired_bri_pct = max(0, current_on_bri - 16)
+                desired_lights_on = desired_bri_pct >= 10
 
         if record_ml:
             self._record_observation_and_learn(
                 event_type="nudge_lighter" if wants_more_light else "nudge_darker",
-                desired_lights_on=wants_more_light or self.controlled_lights_are_on,
-                desired_bri_pct=min(100, self.result.recommended_brightness_pct + (15 if wants_more_light else -15)),
+                desired_lights_on=desired_lights_on,
+                desired_bri_pct=desired_bri_pct,
             )
 
         # Active calibration bypasses manual override and 10-minute anti-flicker cooldown!
@@ -1172,7 +1276,47 @@ class RoomController:
         self.last_adjustment_utc = None
 
         self.async_evaluate_room(self.hub.outdoor_state, trigger_control=False)
-        await self._async_run_lighting_controller(force_apply=True)
+
+        # Immediately adjust the physical lights so the user gets instant visual feedback on every press!
+        if not wants_more_light:
+            if lights_currently_on:
+                if (
+                    not desired_lights_on
+                    or self.result.should_turn_lights_off_while_occupied
+                    or self.result.recommended_brightness_pct <= 0
+                ):
+                    await self._async_turn_off_room_lights(transition=2)
+                    self.controlled_lights_are_on = False
+                else:
+                    # Guarantee a visible downward step of at least 14% from current light brightness
+                    stepped_bri = min(
+                        self.result.recommended_brightness_pct,
+                        max(8, current_on_bri - 14),
+                    )
+                    await self._async_apply_active_scene_or_groups(
+                        stepped_bri,
+                        self.result.recommended_cct_kelvin,
+                        transition=2,
+                    )
+                    self.last_adjustment_utc = datetime.now(timezone.utc)
+        else:
+            # User asked for more light (+): apply immediately if room is occupied or lights are already on
+            if self.is_occupied or lights_currently_on:
+                stepped_bri = max(
+                    self.result.recommended_brightness_pct,
+                    min(100, current_on_bri + 14) if lights_currently_on else 25,
+                )
+                await self._async_apply_active_scene_or_groups(
+                    stepped_bri,
+                    self.result.recommended_cct_kelvin,
+                    transition=2,
+                )
+                self.controlled_lights_are_on = True
+                self.last_adjustment_utc = datetime.now(timezone.utc)
+
+        async_dispatcher_send(
+            self.hass, f"{SIGNAL_ROOM_UPDATED}_{self.room_id}"
+        )
         await self.hub.async_save_runtime_state()
 
     async def async_calibrate_feels_dark_now(self) -> None:
@@ -1213,7 +1357,7 @@ class RoomController:
         )
         # Ensure room lights turn off immediately when user says it's bright enough now
         if self.controlled_lights_are_on:
-            await self._async_turn_off_room_lights(transition=3)
+            await self._async_turn_off_room_lights(transition=2)
             self.controlled_lights_are_on = False
 
     async def async_set_automation_lock(self, locked: bool) -> None:

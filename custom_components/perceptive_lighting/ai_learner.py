@@ -403,7 +403,15 @@ def _score_candidate_combo_on_observation(
 
     # Ideal target lux implied by user's action
     nat = max(1.0, obs.natural_spatial_lux)
-    if obs.user_desired_lights_on:
+    if obs.event_type == "nudge_darker":
+        desired_target = max(2.0, obs.model_target_lux * 0.78)
+        req_scale = clamp(desired_target / max(2.0, target_lux), 0.35, 1.0)
+        loss = abs(math.log2(max(0.1, target_lux / desired_target))) if target_lux > desired_target else 0.0
+    elif obs.event_type == "nudge_lighter":
+        desired_target = max(nat * 1.35, obs.model_target_lux * 1.25)
+        req_scale = clamp(desired_target / max(1.0, target_lux), 1.0, 2.5)
+        loss = abs(math.log2(max(0.1, desired_target / max(1.0, target_lux)))) if target_lux < desired_target else 0.0
+    elif obs.user_desired_lights_on and obs.event_type in ("feels_dark_now", "manual_light_on"):
         # User wanted lights ON -> target_lux should be at least nat + min_artificial_lux * 1.15
         desired_min_target = max(nat * 1.45, nat + min_artificial_lux * 1.15)
         if target_lux >= desired_min_target and pred_lights_on:
@@ -558,16 +566,25 @@ def apply_online_sgd_step(
         active_regime=obs.time_regime,
     )
 
-    # 2. Gentle residual update on activity/environmental multipliers
-    lr = 0.14 if obs.event_type in ("feels_dark_now", "feels_bright_now") else 0.08
-    if obs.user_desired_lights_on:
+    # 2. Determine true directional intent from event_type (fixing bug where nudge_darker with lights on had direction=+1)
+    lr = 0.16 if obs.event_type in ("feels_dark_now", "feels_bright_now") else 0.12
+    if obs.event_type in ("nudge_lighter", "feels_dark_now", "manual_light_on"):
         direction = 1.0
-    else:
+    elif obs.event_type in ("nudge_darker", "feels_bright_now", "manual_light_off"):
         direction = -1.0
+    else:
+        direction = 1.0 if obs.user_desired_bri_pct > obs.model_recommended_bri_pct else -1.0
 
     cur_act = weights.get_activity_multiplier(obs.activity)
     weights.activity_target_multipliers[obs.activity] = clamp(
         cur_act * math.pow(2.0, direction * lr * 0.45), 0.30, 2.50
+    )
+
+    # Directly scale brightness_output_scale on nudges so light brightness visibly steps on every press
+    weights.brightness_output_scale = clamp(
+        weights.brightness_output_scale * math.pow(2.0, direction * lr * 0.90),
+        0.30,
+        1.85,
     )
 
     if obs.is_daytime and obs.outdoor_sky_lux > 800.0:
