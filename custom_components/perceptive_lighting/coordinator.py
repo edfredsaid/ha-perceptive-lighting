@@ -2301,7 +2301,7 @@ class PerceptiveLightingHub:
         add_area = updates.get("add_area_id")
         remove_room = updates.get("remove_room_id")
         if add_area or remove_room:
-            new_opts = dict(self.entry.options or self.entry.data)
+            new_opts = {**dict(self.entry.data), **dict(self.entry.options)}
             rooms_map = dict(new_opts.get(CONF_ROOMS, {}))
             changed = False
             if add_area and add_area not in rooms_map:
@@ -2320,6 +2320,12 @@ class PerceptiveLightingHub:
                 changed = True
             if remove_room and remove_room in rooms_map:
                 del rooms_map[remove_room]
+                dev_reg = dr.async_get(self.hass)
+                dev_entry = dev_reg.async_get_device(
+                    identifiers={(DOMAIN, f"room_{remove_room}")}
+                )
+                if dev_entry:
+                    dev_reg.async_remove_device(dev_entry.id)
                 changed = True
             if changed:
                 new_opts[CONF_ROOMS] = rooms_map

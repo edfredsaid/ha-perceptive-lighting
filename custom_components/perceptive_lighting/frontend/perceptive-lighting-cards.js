@@ -73,13 +73,20 @@ function findRoomSensor(hass, roomKey) {
 
 function findAllRoomSensors(hass) {
   if (!hass || !hass.states) return [];
+  const hubOut = findHubOutdoorSensor(hass);
+  const configuredSet =
+    hubOut && Array.isArray(hubOut.attributes.configured_rooms)
+      ? new Set(hubOut.attributes.configured_rooms)
+      : null;
   return Object.values(hass.states)
     .filter(
       (st) =>
         st.entity_id.startsWith("sensor.") &&
+        st.state !== "unavailable" &&
         st.attributes &&
         st.attributes.room_id &&
-        st.attributes.available_scenes !== undefined
+        st.attributes.available_scenes !== undefined &&
+        (!configuredSet || configuredSet.has(st.attributes.room_id))
     )
     .sort((a, b) =>
       String(a.attributes.room_name || a.attributes.room_id).localeCompare(
@@ -697,7 +704,9 @@ class PerceptiveLightingPanel extends HTMLElement {
       this._activeTab,
       this._roomSubTab,
       this._selectedRegime,
-      out ? `${out.state}:${JSON.stringify(outAttr.regime_weights)}:${JSON.stringify(outAttr.regime_schedule)}` : "no_out",
+      out
+        ? `${out.state}:${JSON.stringify(outAttr.regime_weights)}:${JSON.stringify(outAttr.regime_schedule)}:${JSON.stringify(outAttr.configured_rooms)}:${JSON.stringify(outAttr.all_ha_areas)}`
+        : "no_out",
     ];
     for (const r of rooms) {
       const a = r.attributes;

@@ -64,10 +64,26 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Perceptive Lighting from a config entry."""
     hass.data.setdefault(DOMAIN, {})
+    if hass.data[DOMAIN].get("_loaded_once"):
+        try:
+            import importlib
+            from . import ai_learner, const, coordinator as coord_mod, engine, history_learner
+
+            importlib.reload(const)
+            importlib.reload(engine)
+            importlib.reload(history_learner)
+            importlib.reload(ai_learner)
+            importlib.reload(coord_mod)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Submodule hot-reload note: %s", err)
+    hass.data[DOMAIN]["_loaded_once"] = True
+
     await _async_register_frontend_cards_and_panel(hass)
     _async_register_services(hass)
 
-    hub = PerceptiveLightingHub(hass, entry)
+    from .coordinator import PerceptiveLightingHub as LatestHub
+
+    hub = LatestHub(hass, entry)
     await hub.async_setup()
     hass.data[DOMAIN][entry.entry_id] = hub
 
@@ -175,27 +191,33 @@ async def _async_register_frontend_cards_and_panel(hass: HomeAssistant) -> None:
         )
 
 
+def _iter_hubs(hass: HomeAssistant) -> list[PerceptiveLightingHub]:
+    """Return all active PerceptiveLightingHub instances (duck-typed to support module hot-reload)."""
+    hubs: list[PerceptiveLightingHub] = []
+    for key, val in hass.data.get(DOMAIN, {}).items():
+        if not str(key).startswith("_") and hasattr(val, "rooms") and hasattr(val, "async_update_hub_config"):
+            hubs.append(val)
+    return hubs
+
+
 def _find_room(hass: HomeAssistant, room_key: str) -> RoomController | None:
     """Find a RoomController by room_id, area_id, or room_name across active hubs."""
     key_low = str(room_key).lower().strip()
-    for val in hass.data.get(DOMAIN, {}).values():
-        if isinstance(val, PerceptiveLightingHub):
-            if room_key in val.rooms:
-                return val.rooms[room_key]
-            for rctrl in val.rooms.values():
-                if (
-                    rctrl.room_id.lower() == key_low
-                    or (rctrl.area_id and rctrl.area_id.lower() == key_low)
-                    or rctrl.room_name.lower() == key_low
-                ):
-                    return rctrl
+    for val in _iter_hubs(hass):
+        if room_key in val.rooms:
+            return val.rooms[room_key]
+        for rctrl in val.rooms.values():
+            if (
+                rctrl.room_id.lower() == key_low
+                or (rctrl.area_id and rctrl.area_id.lower() == key_low)
+                or rctrl.room_name.lower() == key_low
+            ):
+                return rctrl
     return None
 
 
 def _async_register_services(hass: HomeAssistant) -> None:
     """Register Perceptive Lighting domain services/actions."""
-    if hass.services.has_service(DOMAIN, SERVICE_UPDATE_ROOM_CONFIG):
-        return
 
     async def handle_apply_adaptive_scene(call: ServiceCall) -> None:
         room = _find_room(hass, call.data["room_id"])
@@ -258,9 +280,8 @@ def _async_register_services(hass: HomeAssistant) -> None:
             await room.async_update_room_config({CONF_EXCLUDED_ENTITIES: excluded})
 
     async def handle_relearn_history(call: ServiceCall) -> None:
-        for val in hass.data.get(DOMAIN, {}).values():
-            if isinstance(val, PerceptiveLightingHub):
-                await val.async_run_historical_learning()
+        for val in _iter_hubs(hass):
+            await val.async_run_historical_learning()
 
     async def handle_optimize_with_ai(call: ServiceCall) -> None:
         room_key = call.data.get("room_id")
@@ -269,17 +290,15 @@ def _async_register_services(hass: HomeAssistant) -> None:
             if room:
                 await room.async_optimize_with_gemini()
         else:
-            for val in hass.data.get(DOMAIN, {}).values():
-                if isinstance(val, PerceptiveLightingHub):
-                    for room in val.rooms.values():
-                        await room.async_optimize_with_gemini()
+            for val in _iter_hubs(hass):
+                for room in val.rooms.values():
+                    await room.async_optimize_with_gemini()
 
     async def handle_reset_room(call: ServiceCall) -> None:
         room_key = call.data.get("room_id")
         if not room_key or str(room_key).lower().strip() == "all":
-            for val in hass.data.get(DOMAIN, {}).values():
-                if isinstance(val, PerceptiveLightingHub):
-                    await val.async_reset_all_rooms()
+            for val in _iter_hubs(hass):
+                await val.async_reset_all_rooms()
         else:
             room = _find_room(hass, room_key)
             if room:
@@ -296,9 +315,8 @@ def _async_register_services(hass: HomeAssistant) -> None:
 
     async def handle_update_hub_config(call: ServiceCall) -> None:
         updates = dict(call.data)
-        for val in hass.data.get(DOMAIN, {}).values():
-            if isinstance(val, PerceptiveLightingHub):
-                await val.async_update_hub_config(updates)
+        for val in _iter_hubs(hass):
+            await val.async_update_hub_config(updates)
 
     hass.services.async_register(
         DOMAIN,
