@@ -738,8 +738,6 @@ def compute_room_perceptive_illuminance(
         prof = sensor_profiles.get(eid)
         placement = prof.placement if prof else "balanced"
         mult = PLACEMENT_MULTIPLIERS.get(placement, 1.0)
-        if prof and placement == "auto_learn":
-            mult = prof.learned_multiplier
 
         cal_val = max(0.0, raw_val * mult)
         calibrated_readings[eid] = cal_val

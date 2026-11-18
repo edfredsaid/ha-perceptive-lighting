@@ -167,6 +167,7 @@ async def async_learn_sensor_profiles_from_history(
             prof.samples_analyzed = total_raw_count
             prof.floor_lux = 0.0
             prof.dropout_knee_lux = 0.0
+            prof.learned_multiplier = 1.0
 
             if nonzero_values:
                 s_nz = sorted(nonzero_values)
@@ -176,19 +177,21 @@ async def async_learn_sensor_profiles_from_history(
                 zero_cnt = sum(1 for v in twilight_values if v <= 0.5)
                 sensor_twilight_zero_ratio[eid] = zero_cnt / len(twilight_values)
 
-            if len(all_values) >= 8:
+            if len(all_values) >= 24:
                 s_all = sorted(all_values)
                 p5_all = s_all[int(len(s_all) * 0.05)]
                 p95_all = s_all[min(len(s_all) - 1, int(len(s_all) * 0.95))]
-                if (p95_all - p5_all) <= 0.5 and p95_all <= 1.0:
+                if (p95_all - p5_all) <= 0.2 and p95_all <= 0.5 and len(daytime_values) >= 12:
                     prof.base_trust_weight = 0.0
                     prof.suggest_blacklist = True
-                    prof.ai_location_guess = "Flatlined / Obstructed (0 lx constant — Recommend Blacklist)"
+                    prof.ai_location_guess = "Flatlined 0 lx Across Daytime"
                     continue
                 else:
-                    if prof.suggest_blacklist and p95_all > 2.0:
-                        prof.suggest_blacklist = False
-                        prof.base_trust_weight = 1.0
+                    prof.suggest_blacklist = False
+                    prof.base_trust_weight = 1.0
+            else:
+                prof.suggest_blacklist = False
+                prof.base_trust_weight = 1.0
 
             if len(daytime_values) >= 6:
                 sorted_day = sorted(daytime_values)
@@ -214,66 +217,38 @@ async def async_learn_sensor_profiles_from_history(
 
                     if baseline_val > 0 and (peak_val / baseline_val) >= 1.45:
                         prof.peak_solar_azimuth = round(best_bin * 30.0 + 15.0, 1)
-                        prof.direct_sun_sensitivity = round(
-                            clamp((peak_val / baseline_val - 1.0) / 3.0, 0.1, 1.0), 2
+                        prof.direct_sun_ratio = round(
+                            clamp(peak_val / baseline_val, 1.0, 3.5), 2
                         )
                     else:
-                        prof.direct_sun_sensitivity = 0.0
+                        prof.direct_sun_ratio = 1.0
 
-        if len(sensor_daytime_medians) >= 2:
-            if is_outdoor:
+        if len(sensor_daytime_medians) >= 1:
+            if is_outdoor and len(sensor_daytime_medians) >= 2:
                 ref_val = max(sensor_daytime_medians.values())
                 for eid, med in sensor_daytime_medians.items():
                     ratio = ref_val / max(1.0, med)
                     profiles[eid].learned_multiplier = round(
                         clamp(ratio, 0.7, 3.5), 2
                     )
-            else:
-                med_vals = sorted(sensor_daytime_medians.values())
-                group_ref = med_vals[len(med_vals) // 2]
-                group_max_p95 = max(sensor_daytime_p95.values(), default=group_ref)
-                min_twilight_zero = min(sensor_twilight_zero_ratio.values(), default=0.0)
-
+            elif not is_outdoor:
+                group_max_p95 = max(sensor_daytime_p95.values(), default=10.0)
                 for eid, med in sensor_daytime_medians.items():
                     prof = profiles[eid]
                     p95_val = sensor_daytime_p95.get(eid, med)
+                    # Keep true physical lux reading (1.0x) unless user explicitly sets a placement profile
+                    prof.learned_multiplier = 1.0
+                    prof.base_trust_weight = 1.0
+                    prof.suggest_blacklist = False
+                    prof.floor_lux = 0.0
+                    prof.dropout_knee_lux = 0.0
 
-                    if p95_val < group_max_p95 * 0.08 and p95_val < 5.0:
-                        prof.base_trust_weight = 0.25
-                        prof.ai_location_guess = "Deeply Shaded / Corner Sensor (Low Dynamic Range)"
+                    if "lux_meter" in eid.lower() or p95_val >= 80.0:
+                        prof.ai_location_guess = "Windowsill / Daylight Reference Sensor"
+                    elif p95_val >= group_max_p95 * 0.55:
+                        prof.ai_location_guess = "Mid-Room Daylight Zone"
                     else:
-                        prof.base_trust_weight = 1.0
-
-                    tw_zero = sensor_twilight_zero_ratio.get(eid, 0.0)
-                    min_nz = sensor_min_nonzero.get(eid, 1.0)
-                    if p95_val >= 80.0 and (
-                        (tw_zero - min_twilight_zero) >= 0.35 or min_nz >= 8.0
-                    ):
-                        prof.floor_lux = round(clamp(min_nz, 2.0, 15.0), 1)
-                        prof.dropout_knee_lux = round(
-                            clamp(prof.floor_lux * 1.6, 4.0, 25.0), 1
-                        )
-                        if not prof.ai_location_guess:
-                            prof.ai_location_guess = (
-                                f"High-Floor Sensor (drops to 0 below ~{prof.floor_lux} lx)"
-                            )
-                    else:
-                        prof.floor_lux = 0.0
-                        prof.dropout_knee_lux = 0.0
-
-                    raw_ratio = group_ref / max(1.0, med)
-                    dampened_ratio = math.pow(raw_ratio, 0.50)
-                    prof.learned_multiplier = round(
-                        clamp(dampened_ratio, 0.5, 2.5), 2
-                    )
-
-                    if not prof.ai_location_guess:
-                        if p95_val >= group_max_p95 * 0.85:
-                            prof.ai_location_guess = "Near Window / Primary Daylight Zone"
-                        elif p95_val >= group_max_p95 * 0.40:
-                            prof.ai_location_guess = "Mid-Room Ambient Zone"
-                        else:
-                            prof.ai_location_guess = "Inner Room / Away from Window"
+                        prof.ai_location_guess = "Inner Room Ambient Sensor"
 
     try:
         recorder_inst = get_instance(hass)

@@ -218,6 +218,10 @@ class RoomPerceptiveIlluminanceSensor(BaseRoomSensor):
                     CONF_TRANSITION_SECONDS, DEFAULT_TRANSITION_SECONDS
                 )
             ),
+            "vacancy_delay_seconds": int(self.room.vacancy_delay_seconds),
+            "vacancy_hold_active": bool(self.room.vacancy_hold_active),
+            "active_trigger_id": self.room.active_trigger_id,
+            "entity_friendly_names": dict(self.room.entity_friendly_names),
             "time_regime": res.time_regime,
             "regime_weights": res.regime_weights,
             "active_illum_model": res.active_illum_model,

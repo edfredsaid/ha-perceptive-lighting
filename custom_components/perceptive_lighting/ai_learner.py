@@ -427,12 +427,11 @@ async def async_run_gemini_room_optimization(
         f"2. LIGHT PRIORITY ORDER FOR PROGRESSIVE DIMMING BELOW 1% (`light_priority_order`):\n"
         f"   When the user dims the room down to 1% and asks for even less light ('-'), we turn off one light source at a time.\n"
         f"   Review the room's lights (`room_lights`): rank all light `entity_id`s in an array `light_priority_order` from "
-        f"   **1st to turn off** (non-dimmable on/off switches first, then high-lumen ceiling/spotlight bulbs) down to "
-        f"   **last light standing at 1%** (softest ambient lamp, shelf, or strip light).\n\n"
-        f"3. SENSOR OUTLIER EVALUATION (`sensor_updates`):\n"
-        f"   Review `sensor_profiles` and live readings. If a sensor is permanently stuck at 0 lx while other sensors in the room "
-        f"   read light, set `base_trust_weight` to 0.0 and `suggest_blacklist` to true. Keep `floor_lux` and `dropout_knee_lux` at 0.0 "
-        f"   unless a sensor has a bright daytime peak (>45 lx) and drops abruptly to 0 lx early.\n\n"
+        f"   **1st to turn off** (non-dimmable on/off switches first, then ceiling floodlights, ceiling main lights, and high-lumen spotlights) down to "
+        f"   **last light standing at 1%** (softest ambient table lamp, TV backlight, shelf, or accent strip light). NEVER place a ceiling floodlight or main ceiling light at the end of the list!\n\n"
+        f"3. SENSOR PLACEMENT LABELING (`sensor_updates`):\n"
+        f"   Review `sensor_profiles`. Provide a human-friendly placement description (`ai_location_guess`, e.g. 'Windowsill Daylight Sensor' or 'Mid-Room Motion Sensor'). "
+        f"   IMPORTANT: Windowsill sensors naturally read 0 lx at night while indoor lights are on—NEVER blacklist or reduce trust weight on sensors that read 0 lx at night!\n\n"
         f"Room Telemetry:\n"
         f"- Daylight Exposure: {daylight_level}\n"
         f"- Current Regime: {current_outdoor.time_regime} ({current_outdoor.regime_explanation})\n"
@@ -538,18 +537,16 @@ async def async_run_gemini_room_optimization(
 
         s_updates = parsed_data.get("sensor_updates")
         if isinstance(s_updates, dict):
-            active_sensor_count = len(sensor_profiles)
             for eid, sdata in s_updates.items():
                 if eid in sensor_profiles and isinstance(sdata, dict):
                     prof = sensor_profiles[eid]
                     if sdata.get("ai_location_guess"):
-                        prof.ai_location_guess = str(sdata["ai_location_guess"])[:100]
-                    if "base_trust_weight" in sdata:
-                        # Don't let AI zero-out the only sensor in a room
-                        min_w = 0.0 if active_sensor_count > 1 else 0.5
-                        prof.base_trust_weight = clamp(float(sdata["base_trust_weight"]), min_w, 1.0)
-                    if "suggest_blacklist" in sdata and active_sensor_count > 1:
-                        prof.suggest_blacklist = bool(sdata["suggest_blacklist"])
+                        guess = str(sdata["ai_location_guess"])[:100]
+                        if "blacklist" not in guess.lower() and "inactive" not in guess.lower():
+                            prof.ai_location_guess = guess
+                    # Never let instantaneous AI snapshots blacklist or zero-out sensors (e.g. windowsill sensors at night)
+                    prof.base_trust_weight = 1.0
+                    prof.suggest_blacklist = False
 
         insight = str(parsed_data.get("insight", "")).strip()
         if insight:

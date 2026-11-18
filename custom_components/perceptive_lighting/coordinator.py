@@ -81,6 +81,7 @@ from .const import (
     CONF_SUN_ENTITY,
     CONF_SUN_WINDOW_DIRECTION,
     CONF_TRANSITION_SECONDS,
+    CONF_VACANCY_DELAY_SECONDS,
     CONF_WEATHER_ENTITY,
     CONF_WINDOW_AZIMUTH,
     DAYLIGHT_MEDIUM,
@@ -91,6 +92,8 @@ from .const import (
     DEFAULT_REGIME_SETTINGS,
     DEFAULT_SUBSTANTIAL_LUX_SHIFT_PCT,
     DEFAULT_TRANSITION_SECONDS,
+    DEFAULT_VACANCY_DELAY_ADAPTIVE_SECONDS,
+    DEFAULT_VACANCY_DELAY_TRANSIT_SECONDS,
     DOMAIN,
     MODE_FULL_ADAPTIVE,
     MODE_SENSOR_ONLY,
@@ -176,7 +179,7 @@ def _classify_light_entity(
         category = "onoff_switch"
         label = "On/Off Switch (Shed 1st)"
         rank = 1
-    elif any(k in combined for k in ("1000lm", "800lm", "ceiling", "main", "room_light", "pendant")):
+    elif any(k in combined for k in ("flood", "1000lm", "800lm", "ceiling", "main", "room_light", "pendant")):
         category = "high_output"
         label = "High-Output / Main Light"
         rank = 2
@@ -242,10 +245,37 @@ class RoomController:
             "humidity_sensors": [],
         }
         self.light_metadata: dict[str, dict[str, Any]] = {}
+        self.entity_friendly_names: dict[str, str] = {}
 
-        # Restore persisted state (with automatic v2.0.0 cleanup of legacy v1.3.x corrupted weights)
+        # Restore persisted state (with v2.1.0 telemetry repair of corrupted thresholds & sensor blacklists)
         pstate = persisted_state if isinstance(persisted_state, dict) else {}
         is_v200_clean = bool(pstate.get("schema_v200_cleaned", False))
+        is_v210_clean = bool(pstate.get("schema_v210_cleaned", False))
+
+        for cfg_key in (
+            CONF_OPERATING_MODE,
+            CONF_CCT_MODE,
+            CONF_DAYLIGHT_LEVEL,
+            CONF_ON_OFF_COOLDOWN_MINUTES,
+            CONF_ADJUST_INTERVAL_MINUTES,
+            CONF_TRANSITION_SECONDS,
+            CONF_VACANCY_DELAY_SECONDS,
+            CONF_EXCLUDED_ENTITIES,
+        ):
+            if cfg_key in pstate and pstate[cfg_key] is not None:
+                self.config[cfg_key] = pstate[cfg_key]
+
+        self.operating_mode = str(
+            self.config.get(CONF_OPERATING_MODE, MODE_FULL_ADAPTIVE)
+        )
+        default_vac_delay = (
+            DEFAULT_VACANCY_DELAY_TRANSIT_SECONDS
+            if self.operating_mode == MODE_SIMPLE_TRANSIT
+            else DEFAULT_VACANCY_DELAY_ADAPTIVE_SECONDS
+        )
+        self.vacancy_delay_seconds: int = int(
+            self.config.get(CONF_VACANCY_DELAY_SECONDS, default_vac_delay)
+        )
 
         self.automation_locked: bool = bool(pstate.get("automation_locked", False))
         self.window_azimuth: float | None = pstate.get(
@@ -271,6 +301,30 @@ class RoomController:
                 if isinstance(raw_rcfgs.get(rkey), dict):
                     self.regime_configs[rkey].update(raw_rcfgs[rkey])
 
+        # v2.1.0 One-Time Repair of wall-switch-drifted thresholds, stuck shed_count, and scene.xxx IDs
+        if not is_v210_clean:
+            day_on = float(self.regime_configs[REGIME_DAY].get("turn_on_lux", 12.0))
+            for rkey in TIME_REGIMES:
+                rc = self.regime_configs[rkey]
+                for sfield in ("occupied_scene", "off_scene"):
+                    sval = str(rc.get(sfield, ""))
+                    if sval.startswith("scene."):
+                        rc[sfield] = f"ha_{sval.replace('scene.', '')}"
+                if int(rc.get("target_brightness_pct", 60)) > 5 and int(rc.get("shed_count", 0)) > 0:
+                    rc["shed_count"] = 0
+                if rkey == REGIME_MORNING and int(rc.get("target_brightness_pct", 60)) < 20:
+                    rc["target_brightness_pct"] = 60
+                if rkey in (REGIME_MORNING, REGIME_EVENING):
+                    cur_on = float(rc.get("turn_on_lux", 12.0))
+                    if cur_on < 6.0 and day_on >= 12.0:
+                        rc["turn_on_lux"] = round(max(12.0, day_on * 0.85), 1)
+                    elif cur_on > 50.0 and day_on <= 25.0:
+                        rc["turn_on_lux"] = 22.0
+                rc["target_total_lux"] = round(
+                    max(float(rc.get("turn_on_lux", 10.0)) + 2.0, float(rc.get("target_total_lux", 14.0))),
+                    1,
+                )
+
         # Per-regime entity triggers
         raw_triggers = pstate.get(
             CONF_SCENE_TRIGGERS, room_config.get(CONF_SCENE_TRIGGERS, [])
@@ -280,6 +334,11 @@ class RoomController:
             if isinstance(raw_triggers, list)
             else []
         )
+        for trig in self.scene_triggers:
+            tsid = str(trig.get("scene_id", ""))
+            if tsid.startswith("scene."):
+                trig["scene_id"] = f"ha_{tsid.replace('scene.', '')}"
+
         # Migrate legacy CONF_ACTIVITY_TRIGGERS if present and scene_triggers is empty
         if not self.scene_triggers and isinstance(room_config.get(CONF_ACTIVITY_TRIGGERS), dict):
             for idx, (teid, tact) in enumerate(room_config[CONF_ACTIVITY_TRIGGERS].items()):
@@ -295,24 +354,35 @@ class RoomController:
                 )
 
         # Light priority ordering for progressive 1% shedding
-        self.light_priority_order: list[str] = list(
-            pstate.get(
-                CONF_LIGHT_PRIORITY_ORDER,
-                room_config.get(CONF_LIGHT_PRIORITY_ORDER, []),
-            )
-        )
         self.light_order_locked: bool = bool(
             pstate.get(
                 CONF_LIGHT_ORDER_LOCKED,
                 room_config.get(CONF_LIGHT_ORDER_LOCKED, False),
             )
         )
+        self.light_priority_order: list[str] = (
+            list(
+                pstate.get(
+                    CONF_LIGHT_PRIORITY_ORDER,
+                    room_config.get(CONF_LIGHT_PRIORITY_ORDER, []),
+                )
+            )
+            if (is_v210_clean or self.light_order_locked)
+            else []
+        )
 
         # Sensor profiles & learned weights
         self.sensor_profiles: dict[str, SensorLearnedProfile] = {}
         if is_v200_clean:
             for eid, pdata in pstate.get("sensor_profiles", {}).items():
-                self.sensor_profiles[eid] = SensorLearnedProfile.from_dict(pdata)
+                prof = SensorLearnedProfile.from_dict(pdata)
+                if not is_v210_clean:
+                    prof.suggest_blacklist = False
+                    prof.base_trust_weight = 1.0
+                    prof.learned_multiplier = 1.0
+                    prof.floor_lux = 0.0
+                    prof.dropout_knee_lux = 0.0
+                self.sensor_profiles[eid] = prof
             for eid, pdata in room_config.get(CONF_SENSOR_PROFILES, {}).items():
                 if eid not in self.sensor_profiles and isinstance(pdata, dict):
                     self.sensor_profiles[eid] = SensorLearnedProfile.from_dict(pdata)
@@ -343,7 +413,11 @@ class RoomController:
         self.adaptive_scenes: dict[str, AdaptiveSceneSpec] = {}
         for sid, sdata in pstate.get("adaptive_scenes", {}).items():
             if isinstance(sdata, dict):
-                self.adaptive_scenes[sid] = AdaptiveSceneSpec.from_dict(sdata)
+                spec = AdaptiveSceneSpec.from_dict(sdata)
+                if not is_v210_clean and spec.linked_ha_scene_entity:
+                    # Clear stale 0.8s mid-transition snapshots so linked HA scenes re-snapshot cleanly
+                    spec.light_states = {}
+                self.adaptive_scenes[sid] = spec
         for sid, sdata in room_config.get(CONF_ADAPTIVE_SCENES, {}).items():
             if sid not in self.adaptive_scenes and isinstance(sdata, dict):
                 self.adaptive_scenes[sid] = AdaptiveSceneSpec.from_dict(sdata)
@@ -354,6 +428,9 @@ class RoomController:
         )
         self.smoothed_indoor_lux: dict[str, float] = {}
         self.is_occupied: bool = False
+        self.vacancy_hold_active: bool = False
+        self._last_presence_seen_utc: datetime | None = None
+        self._vacancy_timer_unsub: Any = None
         self.occupied_by_entities: list[str] = []
         self.manual_override_active: bool = False
         self.manual_override_baseline_natural_pct: float | None = None
@@ -366,6 +443,9 @@ class RoomController:
         self.pre_light_natural_lux: float | None = None
         self.resolved_scene_id: str = "all_lights"
         self.resolved_scene_reason: str = "Default Room Lights"
+        self.active_trigger_id: str | None = None
+        self._last_resolved_scene_id: str | None = None
+        self._last_active_trigger_id: str | None = None
         self.decision_reason: str = "Initializing..."
         self._recent_context_ids: set[str] = set()
         self._ignore_light_events_until_utc: datetime | None = None
@@ -394,10 +474,25 @@ class RoomController:
         return elapsed < (cooldown_mins * 60.0)
 
     def to_persisted_dict(self) -> dict[str, Any]:
-        """Serialize runtime state for persistent storage."""
+        """Serialize runtime state and all room configuration overrides for persistent storage."""
         return {
             "schema_v200_cleaned": True,
+            "schema_v210_cleaned": True,
             "automation_locked": self.automation_locked,
+            CONF_OPERATING_MODE: self.operating_mode,
+            CONF_CCT_MODE: self.config.get(CONF_CCT_MODE, CCT_EXTERNAL),
+            CONF_DAYLIGHT_LEVEL: self.config.get(CONF_DAYLIGHT_LEVEL, DAYLIGHT_MEDIUM),
+            CONF_ON_OFF_COOLDOWN_MINUTES: float(
+                self.config.get(CONF_ON_OFF_COOLDOWN_MINUTES, DEFAULT_ON_OFF_COOLDOWN_MINUTES)
+            ),
+            CONF_ADJUST_INTERVAL_MINUTES: float(
+                self.config.get(CONF_ADJUST_INTERVAL_MINUTES, DEFAULT_ADJUST_INTERVAL_MINUTES)
+            ),
+            CONF_TRANSITION_SECONDS: int(
+                self.config.get(CONF_TRANSITION_SECONDS, DEFAULT_TRANSITION_SECONDS)
+            ),
+            CONF_VACANCY_DELAY_SECONDS: int(self.vacancy_delay_seconds),
+            CONF_EXCLUDED_ENTITIES: list(self.excluded_entities),
             "window_azimuth": self.window_azimuth,
             "active_activity": self.active_activity,
             "active_scene_id": self.active_scene_id,
@@ -508,12 +603,14 @@ class RoomController:
                     else None
                 )
             )
-            fname = (
-                entry.name
+            raw_fname = (
+                (state_obj.attributes.get("friendly_name") if state_obj else None)
+                or entry.name
                 or entry.original_name
-                or (state_obj.attributes.get("friendly_name", "") if state_obj else "")
-                or ""
-            ).lower()
+                or eid
+            )
+            self.entity_friendly_names[eid] = str(raw_fname)
+            fname = str(raw_fname).lower()
             eid_low = eid.lower()
 
             if domain == "sensor" and (
@@ -556,24 +653,11 @@ class RoomController:
                 "occupancy",
                 "presence",
             ):
-                # Exclude Aqara PIR 10-min synthetic occupancy cluster & contact/opening entities
-                if (
-                    ("lumi" in eid_low and "sensor_motion" in eid_low and "occupancy" in eid_low)
-                    or eid_low.endswith("_opening")
-                ):
+                # Only skip contact/door opening sensors; keep all PIR, mmWave, FP2 zones, and occupancy groups!
+                if eid_low.endswith("_opening"):
                     continue
                 pres_list.append(eid)
-                is_pres_helper = (
-                    entry.device_id is None
-                    or eid_low.startswith("binary_sensor.motion_")
-                    or eid_low.startswith("binary_sensor.presence_")
-                    or "group_occupancy" in eid_low
-                    or entry.platform in ("group", "template", "bayesian")
-                )
-                if is_pres_helper:
-                    helper_pres_list.append(eid)
-                else:
-                    physical_pres_list.append(eid)
+                physical_pres_list.append(eid)
 
             elif domain == "media_player":
                 media_list.append(eid)
@@ -614,12 +698,11 @@ class RoomController:
             "lights": sorted(light_list),
         }
 
-        # Automatically exclude aggregate helpers when physical sensors exist so we never double-count!
+        # Only auto-exclude synthetic illuminance average helpers when physical lux sensors exist;
+        # NEVER auto-exclude presence sensors, FP2 zones, or user occupancy groups!
         auto_helpers: set[str] = set()
         if physical_lux_list and helper_lux_list:
             auto_helpers.update(helper_lux_list)
-        if physical_pres_list and helper_pres_list:
-            auto_helpers.update(helper_pres_list)
         self.auto_excluded_helpers = sorted(auto_helpers)
 
         excluded = self.excluded_entities | auto_helpers
@@ -632,12 +715,10 @@ class RoomController:
 
         self.temp_sensors = [e for e in self.all_area_entities["temperature_sensors"] if e not in self.excluded_entities]
         self.humidity_sensors = [e for e in self.all_area_entities["humidity_sensors"] if e not in self.excluded_entities]
-        self.presence_sensors = [e for e in self.all_area_entities["presence_sensors"] if e not in excluded]
-        if not self.presence_sensors and self.all_area_entities["presence_sensors"]:
-            self.presence_sensors = [
-                e for e in self.all_area_entities["presence_sensors"]
-                if e not in self.excluded_entities
-            ]
+        self.presence_sensors = [
+            e for e in self.all_area_entities["presence_sensors"]
+            if e not in self.excluded_entities
+        ]
 
         self.media_players = (
             [e for e in self.all_area_entities["media_players"] if e not in self.excluded_entities]
@@ -711,11 +792,12 @@ class RoomController:
 
         for scene_eid in linked_scenes:
             sid = f"ha_{scene_eid.replace('scene.', '')}"
+            st = self.hass.states.get(scene_eid)
+            friendly = (
+                st.attributes.get("friendly_name", scene_eid) if st else scene_eid
+            )
+            self.entity_friendly_names[scene_eid] = str(friendly)
             if sid not in self.adaptive_scenes:
-                st = self.hass.states.get(scene_eid)
-                friendly = (
-                    st.attributes.get("friendly_name", scene_eid) if st else scene_eid
-                )
                 clean_name = friendly
                 if clean_name.lower().startswith(self.room_name.lower()):
                     clean_name = clean_name[len(self.room_name) :].strip(" -_:") or friendly
@@ -726,6 +808,46 @@ class RoomController:
                     reference_deficit_pct=65.0,
                     linked_ha_scene_entity=scene_eid,
                 )
+
+    def _rebuild_light_priority_order(self) -> None:
+        """Rebuild automatic fixture priority order from `self.light_metadata` (On/Off & Flood/Main first -> Accent last)."""
+        self.light_priority_order = sorted(
+            self.lights,
+            key=lambda e: (
+                self.light_metadata.get(e, {}).get("heuristic_rank", 4),
+                str(self.light_metadata.get(e, {}).get("friendly_name", e)).lower(),
+            ),
+        )
+
+    def _get_or_create_scene_spec(self, scene_id: str) -> AdaptiveSceneSpec | None:
+        """Resolve an `AdaptiveSceneSpec` by `scene_id`, `ha_<name>`, or native `scene.<name>` entity_id."""
+        if not scene_id or scene_id in ("default", "all_lights", "off"):
+            return None
+        if scene_id in self.adaptive_scenes:
+            return self.adaptive_scenes[scene_id]
+        if scene_id.startswith("scene."):
+            ha_sid = f"ha_{scene_id.replace('scene.', '')}"
+            if ha_sid in self.adaptive_scenes:
+                return self.adaptive_scenes[ha_sid]
+            st = self.hass.states.get(scene_id)
+            if st is not None:
+                friendly = st.attributes.get("friendly_name", scene_id)
+                clean_name = str(friendly)
+                if clean_name.lower().startswith(self.room_name.lower()):
+                    clean_name = clean_name[len(self.room_name) :].strip(" -_:") or str(friendly)
+                spec = AdaptiveSceneSpec(
+                    scene_id=ha_sid,
+                    name=clean_name,
+                    activity=self._guess_activity_from_name(clean_name),
+                    reference_deficit_pct=65.0,
+                    linked_ha_scene_entity=scene_id,
+                )
+                self.adaptive_scenes[ha_sid] = spec
+                return spec
+        for spec in self.adaptive_scenes.values():
+            if spec.linked_ha_scene_entity == scene_id:
+                return spec
+        return None
 
     @staticmethod
     def _guess_activity_from_name(name: str) -> str:
@@ -753,6 +875,8 @@ class RoomController:
 
     def _resolve_active_scene(self, regime: str) -> tuple[str, bool, str]:
         """Determine (scene_id, scale_dynamically, reason_str) for the current regime and entity triggers."""
+        self.active_trigger_id = None
+
         # 1. Manual scene selection while occupied takes top priority
         if self.manual_scene_override_id and self.manual_scene_override_id not in ("default", ""):
             opts = self.get_available_scene_options()
@@ -778,19 +902,25 @@ class RoomController:
             teid = trig.get("entity_id")
             target_states = [str(s).lower() for s in (trig.get("states") or ["on", "playing"])]
             target_scene = str(trig.get("scene_id") or "all_lights")
+            if target_scene.startswith("scene."):
+                target_scene = f"ha_{target_scene.replace('scene.', '')}"
             scale_dyn = bool(trig.get("scale_dynamically", trig.get("dynamic_scaling", True)))
             st = self.hass.states.get(teid)
             if st and st.state.lower() in target_states:
                 fname = st.attributes.get("friendly_name", teid)
+                self.entity_friendly_names[str(teid)] = str(fname)
+                self.active_trigger_id = str(trig.get("id") or teid)
                 return (
                     target_scene,
                     scale_dyn,
-                    f"Trigger ({fname} = {st.state})",
+                    f"Rule ({fname} is {st.state})",
                 )
 
         if self.is_occupied and presence_triggers:
             trig = presence_triggers[0]
             target_scene = str(trig.get("scene_id") or "all_lights")
+            if target_scene.startswith("scene."):
+                target_scene = f"ha_{target_scene.replace('scene.', '')}"
             scale_dyn = bool(trig.get("scale_dynamically", trig.get("dynamic_scaling", True)))
             opts = self.get_available_scene_options()
             s_label = opts.get(target_scene, target_scene)
@@ -803,9 +933,11 @@ class RoomController:
         # 3. Otherwise use the active Time-of-Day Regime's Default Occupied Scene
         rcfg = self.regime_configs.get(regime, DEFAULT_REGIME_SETTINGS.get(regime, {}))
         occ_scene = str(rcfg.get("occupied_scene") or "all_lights")
+        if occ_scene.startswith("scene."):
+            occ_scene = f"ha_{occ_scene.replace('scene.', '')}"
         opts = self.get_available_scene_options()
         s_label = opts.get(occ_scene, occ_scene)
-        return occ_scene, True, f"{regime.title()} Default ({s_label})"
+        return occ_scene, True, f"{regime.title()} Schedule ({s_label})"
 
     @callback
     def async_evaluate_room(
@@ -893,11 +1025,25 @@ class RoomController:
         indoor_humidity_pct = (sum(hum_vals) / len(hum_vals)) if hum_vals else None
 
         # 4. Resolve active Scene & Trigger for current Time-of-Day Regime
+        prev_scene = self._last_resolved_scene_id
+        prev_trig = self._last_active_trigger_id
         resolved_scene, _, scene_reason = self._resolve_active_scene(outdoor.time_regime)
         self.resolved_scene_id = resolved_scene
         self.resolved_scene_reason = scene_reason
-        if resolved_scene in self.adaptive_scenes:
-            self.active_activity = self.adaptive_scenes[resolved_scene].activity
+
+        trigger_just_changed = prev_trig != self.active_trigger_id
+        scene_just_changed = (prev_scene is not None and prev_scene != resolved_scene) or trigger_just_changed
+        self._last_resolved_scene_id = resolved_scene
+        self._last_active_trigger_id = self.active_trigger_id
+
+        if trigger_just_changed and self.active_trigger_id is not None:
+            # An entity conditional trigger (e.g. TV playing) just fired -> override any prior manual hold!
+            self.manual_override_active = False
+            self.manual_override_baseline_natural_pct = None
+
+        spec_obj = self._get_or_create_scene_spec(resolved_scene)
+        if spec_obj:
+            self.active_activity = spec_obj.activity
         elif resolved_scene.startswith("activity_"):
             act_k = resolved_scene.replace("activity_", "", 1)
             if act_k in ACTIVITY_DEFINITIONS:
@@ -930,7 +1076,7 @@ class RoomController:
             regime_configs=self.regime_configs,
         )
 
-        # 6. Evaluate occupancy (presence sensors + optional media players)
+        # 6. Evaluate occupancy (presence sensors + optional media players + Vacancy Grace Hold Timer)
         was_occupied = self.is_occupied
         self.is_occupied = self._compute_occupancy()
 
@@ -942,17 +1088,6 @@ class RoomController:
             if self.manual_scene_override_id is not None:
                 self.manual_scene_override_id = None
                 self.active_scene_id = "default"
-        elif (
-            self.manual_override_active
-            and self.manual_override_baseline_natural_pct is not None
-        ):
-            shift = abs(
-                self.result.natural_perceptive_illuminance_pct
-                - self.manual_override_baseline_natural_pct
-            )
-            if shift >= DEFAULT_SUBSTANTIAL_LUX_SHIFT_PCT:
-                self.manual_override_active = False
-                self.manual_override_baseline_natural_pct = None
 
         self._update_decision_explanation()
 
@@ -967,25 +1102,66 @@ class RoomController:
         ):
             self.hass.async_create_task(
                 self._async_run_lighting_controller(
-                    occupancy_just_changed=(self.is_occupied != was_occupied)
+                    occupancy_just_changed=(self.is_occupied != was_occupied),
+                    force_apply=scene_just_changed and self.is_occupied,
                 )
             )
 
+    @callback
+    def _async_on_vacancy_hold_expired(self, _now: datetime) -> None:
+        """Called when the room's Vacancy Hold grace timer expires after motion clears."""
+        self._vacancy_timer_unsub = None
+        self.async_evaluate_room(self.hub.outdoor_state, trigger_control=True)
+
     def _compute_occupancy(self) -> bool:
-        """Return True if any presence sensor or active media player indicates occupancy, recording which ones."""
+        """Return True if any presence sensor or active media player indicates occupancy, or if within the Vacancy Hold grace window."""
         active_by: list[str] = []
         for peid in self.presence_sensors:
             st = self.hass.states.get(peid)
             if st and st.state == STATE_ON:
-                active_by.append(st.attributes.get("friendly_name", peid))
+                fname = st.attributes.get("friendly_name", peid)
+                self.entity_friendly_names[peid] = str(fname)
+                active_by.append(str(fname))
 
         for meid in self.media_players:
             st = self.hass.states.get(meid)
             if st and st.state in (STATE_PLAYING, "paused", "buffering"):
-                active_by.append(f"{st.attributes.get('friendly_name', meid)} ({st.state})")
+                fname = st.attributes.get("friendly_name", meid)
+                self.entity_friendly_names[meid] = str(fname)
+                active_by.append(f"{fname} ({st.state})")
 
-        self.occupied_by_entities = active_by
-        return len(active_by) > 0
+        now = datetime.now(timezone.utc)
+        if active_by:
+            self._last_presence_seen_utc = now
+            self.vacancy_hold_active = False
+            if self._vacancy_timer_unsub is not None:
+                self._vacancy_timer_unsub()
+                self._vacancy_timer_unsub = None
+            self.occupied_by_entities = active_by
+            return True
+
+        # Raw presence sensors are currently OFF: check Vacancy Hold grace period
+        if (
+            self.is_occupied
+            and self.vacancy_delay_seconds > 0
+            and self._last_presence_seen_utc is not None
+        ):
+            elapsed = (now - self._last_presence_seen_utc).total_seconds()
+            rem = self.vacancy_delay_seconds - elapsed
+            if rem > 0.5:
+                self.vacancy_hold_active = True
+                self.occupied_by_entities = [
+                    f"Occupancy Hold ({int(round(rem))}s grace after motion cleared)"
+                ]
+                if self._vacancy_timer_unsub is None:
+                    self._vacancy_timer_unsub = async_call_later(
+                        self.hass, rem + 0.25, self._async_on_vacancy_hold_expired
+                    )
+                return True
+
+        self.vacancy_hold_active = False
+        self.occupied_by_entities = []
+        return False
 
     def _update_decision_explanation(self) -> None:
         """Build a plain-English diagnostic explanation of what the room controller is doing and why."""
@@ -1018,8 +1194,15 @@ class RoomController:
         occ_str = ", ".join(self.occupied_by_entities[:2]) if self.occupied_by_entities else "Occupied"
         if self.manual_override_active:
             self.decision_reason = (
-                f"Occupied ({occ_str}) • Manual Override Active at {self._get_current_on_brightness_pct()}% "
-                f"(Total Lux {res.effective_spatial_lux:.1f} lx) — Resets on vacancy"
+                f"Occupied ({occ_str}) • Manual Hold Active ({self._get_current_on_brightness_pct()}%) "
+                f"— Locked until room is vacant (no impact on schedule)"
+            )
+            return
+
+        if self.active_trigger_id is not None:
+            self.decision_reason = (
+                f"Occupied ({occ_str}) • {self.resolved_scene_reason} active "
+                f"at {max(1, res.recommended_brightness_pct or int(rcfg.get('target_brightness_pct', 60)))}%"
             )
             return
 
@@ -1115,14 +1298,21 @@ class RoomController:
         if self.manual_override_active and not force_apply:
             return
 
-        # Case 2: Room is OCCUPIED (or force_apply from calibration / scene selector)
+        # Case 2: Room is OCCUPIED (or force_apply from calibration / scene selector / conditional trigger)
         rec_bri = self.result.recommended_brightness_pct
         rec_cct = self.result.recommended_cct_kelvin
         rec_shed = self.result.recommended_shed_count
         scene_id, scale_dyn, _ = self._resolve_active_scene(reg)
 
-        wants_lights_on = self.result.should_turn_lights_on and rec_bri > 0
-        wants_lights_off = self.result.should_turn_lights_off_while_occupied
+        if self.active_trigger_id is not None:
+            # Active device conditional rule (e.g. TV playing -> Projector scene) applies regardless of daylight threshold
+            wants_lights_on = True
+            wants_lights_off = False
+            if rec_bri <= 0:
+                rec_bri = max(1, int(rcfg.get("target_brightness_pct", 50)))
+        else:
+            wants_lights_on = self.result.should_turn_lights_on and rec_bri > 0
+            wants_lights_off = self.result.should_turn_lights_off_while_occupied
 
         if not self.controlled_lights_are_on or self.off_scene_currently_active:
             if wants_lights_on or (force_apply and not wants_lights_off):
@@ -1254,7 +1444,7 @@ class RoomController:
         apply_cct = cct_mode == CCT_KRUITHOF
         clamped_bri = int(clamp(target_brightness_pct, 1, 100))
 
-        spec = self.adaptive_scenes.get(scene_id)
+        spec = self._get_or_create_scene_spec(scene_id)
         if spec:
             await self._async_apply_calibrated_scene(
                 spec,
@@ -1312,22 +1502,22 @@ class RoomController:
         transition: int = 12,
     ) -> None:
         """Apply an Adaptive/HA Scene scaled dynamically to `target_brightness_pct` (1%..100%) and `shed_count`."""
-        # If linked to a native HA scene without captured per-light snapshot yet, activate & snapshot it first
+        # If linked to a native HA scene without captured per-light snapshot yet, activate & snapshot after settled
         if spec.linked_ha_scene_entity and not spec.light_states:
             ctx = self._make_context()
             self._ignore_light_events_until_utc = datetime.now(timezone.utc) + timedelta(
-                seconds=max(6.0, float(min(transition, 5)) + 4.0)
+                seconds=max(7.0, float(min(transition, 5)) + 5.0)
             )
             await self.hass.services.async_call(
                 "scene",
                 "turn_on",
                 {
                     ATTR_ENTITY_ID: spec.linked_ha_scene_entity,
-                    "transition": min(transition, 4),
+                    "transition": 1,
                 },
                 context=ctx,
             )
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(2.2)
             self._snapshot_current_lights_into_scene(spec)
 
         if not spec.light_states:
@@ -1404,8 +1594,19 @@ class RoomController:
 
     def _snapshot_current_lights_into_scene(self, spec: AdaptiveSceneSpec) -> None:
         """Record current on/off, brightness, and color of room lights into an AdaptiveSceneSpec."""
+        scene_member_set: set[str] | None = None
+        if spec.linked_ha_scene_entity:
+            scene_st = self.hass.states.get(spec.linked_ha_scene_entity)
+            if scene_st:
+                raw_members = scene_st.attributes.get("entity_id")
+                if isinstance(raw_members, (list, tuple)) and raw_members:
+                    scene_member_set = set(str(m) for m in raw_members)
+
         snapshot: dict[str, dict[str, Any]] = {}
         for eid in self.lights:
+            if scene_member_set is not None and eid not in scene_member_set:
+                snapshot[eid] = {"state": STATE_OFF, "brightness_pct": 0}
+                continue
             st = self.hass.states.get(eid)
             if not st:
                 continue
@@ -1546,56 +1747,13 @@ class RoomController:
 
     @callback
     def _async_on_manual_change_settled(self, _now: datetime) -> None:
-        """Called once 4.5 seconds after the user finishes adjusting a wall switch or dimmer slider."""
+        """Called once 4.5 seconds after a wall-switch or external app light change settles.
+
+        Holds Manual Override ('Locked until vacant') without altering the room's automated schedule or thresholds.
+        """
         self._manual_debounce_unsub = None
+        self.manual_override_active = True
         self.async_evaluate_room(self.hub.outdoor_state, trigger_control=False)
-
-        cur_bri = self._get_current_on_brightness_pct()
-        lights_on = any(
-            (st := self.hass.states.get(e)) and st.state == STATE_ON
-            for e in self.lights
-        )
-        measured_total_lux = self.result.effective_spatial_lux
-        r_weights = self.hub.outdoor_state.regime_weights or {
-            self.hub.outdoor_state.time_regime: 1.0
-        }
-
-        if not lights_on:
-            # User manually turned room lights OFF while occupied -> current lux is bright enough!
-            for rkey, w in r_weights.items():
-                if w >= 0.15:
-                    cur_on = float(self.regime_configs[rkey]["turn_on_lux"])
-                    desired_on = max(0.5, min(cur_on, measured_total_lux * 0.80))
-                    self.regime_configs[rkey]["turn_on_lux"] = round(
-                        (1.0 - w * 0.75) * cur_on + (w * 0.75) * desired_on, 1
-                    )
-        else:
-            # User manually turned lights ON or set brightness -> adopt their brightness & measured Total Room Lux!
-            for rkey, w in r_weights.items():
-                if w >= 0.15:
-                    cur_on = float(self.regime_configs[rkey]["turn_on_lux"])
-                    if self._pending_manual_event_type == "manual_light_on":
-                        pre_lux = self.pre_light_natural_lux or measured_total_lux
-                        if pre_lux >= cur_on:
-                            self.regime_configs[rkey]["turn_on_lux"] = round(
-                                pre_lux + 2.0, 1
-                            )
-                    old_bri = float(self.regime_configs[rkey]["target_brightness_pct"])
-                    self.regime_configs[rkey]["target_brightness_pct"] = int(
-                        clamp(round((1.0 - w * 0.8) * old_bri + (w * 0.8) * cur_bri), 1, 100)
-                    )
-                    self.regime_configs[rkey]["target_total_lux"] = round(
-                        max(1.5, measured_total_lux), 1
-                    )
-
-        self._record_observation_and_learn(
-            event_type=self._pending_manual_event_type,
-            desired_lights_on=lights_on,
-            desired_bri_pct=cur_bri if lights_on else 0,
-            shed_count=self.active_shed_count,
-        )
-        self.async_evaluate_room(self.hub.outdoor_state, trigger_control=False)
-        self.hass.async_create_task(self.hub.async_save_runtime_state())
 
     def _schedule_settled_lux_measurement(
         self,
@@ -1604,33 +1762,25 @@ class RoomController:
         desired_bri_pct: int,
         shed_count: int,
     ) -> None:
-        """Schedule a 5-second settled sensor read after a direct user button control (`+` / `-` / calibrate)."""
+        """Schedule a 5-second settled sensor read after a direct user teaching control (`+` / `-` / calibrate)."""
         if self._settle_measure_unsub is not None:
             self._settle_measure_unsub()
 
         @callback
         def _on_settled(_now: datetime) -> None:
             self._settle_measure_unsub = None
-            # Re-read raw sensor states directly so we get the fresh post-transition Total Room Lux
-            fresh_vals: list[float] = []
             for eid in self.lux_sensors:
-                prof = self.sensor_profiles.get(eid)
-                if prof and prof.suggest_blacklist:
-                    continue
                 st = self.hass.states.get(eid)
                 if st and st.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE):
                     try:
-                        val = float(st.state)
-                        self.smoothed_indoor_lux[eid] = val
-                        fresh_vals.append(val)
+                        self.smoothed_indoor_lux[eid] = float(st.state)
                     except (ValueError, TypeError):
                         pass
 
-            settled_lux = (
-                sum(fresh_vals) / len(fresh_vals)
-                if fresh_vals
-                else self.result.effective_spatial_lux
-            )
+            # Re-evaluate first so `effective_spatial_lux` reflects sensor placement multipliers
+            self.async_evaluate_room(self.hub.outdoor_state, trigger_control=False)
+            settled_lux = self.result.effective_spatial_lux
+
             r_weights = self.hub.outdoor_state.regime_weights or {
                 self.hub.outdoor_state.time_regime: 1.0
             }
@@ -1642,7 +1792,7 @@ class RoomController:
                             max(1.5, settled_lux), 1
                         )
             else:
-                # Lights were turned OFF via "Feels Bright Enough": settled_lux is the unlit natural room lux!
+                # Lights were turned OFF via "Bright Enough": settled_lux is the unlit natural room lux!
                 for rkey, w in r_weights.items():
                     if w >= 0.10:
                         cur_on = float(self.regime_configs[rkey]["turn_on_lux"])
@@ -1746,8 +1896,22 @@ class RoomController:
             if isinstance(ai_order, list) and ai_order:
                 valid_ai_order = [e for e in ai_order if e in self.lights]
                 remaining = [e for e in self.lights if e not in valid_ai_order]
-                if valid_ai_order:
-                    self.light_priority_order = valid_ai_order + remaining
+                combined_order = valid_ai_order + remaining
+                # Ensure switches and ceiling flood/main lights (rank <= 2) are never placed after soft lamps/accents (rank >= 4)
+                early_shed = [
+                    e for e in combined_order
+                    if self.light_metadata.get(e, {}).get("heuristic_rank", 4) <= 2
+                ]
+                mid_shed = [
+                    e for e in combined_order
+                    if self.light_metadata.get(e, {}).get("heuristic_rank", 4) == 3
+                ]
+                late_keep = [
+                    e for e in combined_order
+                    if self.light_metadata.get(e, {}).get("heuristic_rank", 4) >= 4
+                ]
+                if early_shed or mid_shed or late_keep:
+                    self.light_priority_order = early_shed + mid_shed + late_keep
 
         self.async_evaluate_room(self.hub.outdoor_state, trigger_control=False)
         await self.hub.async_save_runtime_state()
@@ -2048,7 +2212,7 @@ class RoomController:
         await self.hub.async_save_runtime_state()
 
     async def async_update_room_config(self, updates: dict[str, Any]) -> None:
-        """Update room configuration (light priority order, regime configs, scene triggers, mode, exclusions, etc.) from Sidebar UI."""
+        """Update room configuration (light priority order, regime configs, scene triggers, vacancy hold, sensor roles, exclusions) from Sidebar UI."""
         if CONF_OPERATING_MODE in updates:
             self.operating_mode = str(updates[CONF_OPERATING_MODE])
             self.config[CONF_OPERATING_MODE] = self.operating_mode
@@ -2057,11 +2221,29 @@ class RoomController:
         if CONF_CCT_MODE in updates:
             self.config[CONF_CCT_MODE] = str(updates[CONF_CCT_MODE])
         if CONF_ON_OFF_COOLDOWN_MINUTES in updates:
-            self.config[CONF_ON_OFF_COOLDOWN_MINUTES] = int(updates[CONF_ON_OFF_COOLDOWN_MINUTES])
+            self.config[CONF_ON_OFF_COOLDOWN_MINUTES] = round(
+                clamp(float(updates[CONF_ON_OFF_COOLDOWN_MINUTES]), 0.0, 60.0), 1
+            )
         if CONF_ADJUST_INTERVAL_MINUTES in updates:
-            self.config[CONF_ADJUST_INTERVAL_MINUTES] = int(updates[CONF_ADJUST_INTERVAL_MINUTES])
+            self.config[CONF_ADJUST_INTERVAL_MINUTES] = round(
+                clamp(float(updates[CONF_ADJUST_INTERVAL_MINUTES]), 0.5, 60.0), 1
+            )
         if CONF_TRANSITION_SECONDS in updates:
-            self.config[CONF_TRANSITION_SECONDS] = int(updates[CONF_TRANSITION_SECONDS])
+            self.config[CONF_TRANSITION_SECONDS] = int(
+                clamp(float(updates[CONF_TRANSITION_SECONDS]), 0.0, 60.0)
+            )
+        if CONF_VACANCY_DELAY_SECONDS in updates:
+            self.vacancy_delay_seconds = int(
+                clamp(float(updates[CONF_VACANCY_DELAY_SECONDS]), 0.0, 1800.0)
+            )
+            self.config[CONF_VACANCY_DELAY_SECONDS] = self.vacancy_delay_seconds
+        if "sensor_placements" in updates and isinstance(updates["sensor_placements"], dict):
+            for seid, splace in updates["sensor_placements"].items():
+                if seid not in self.sensor_profiles:
+                    self.sensor_profiles[seid] = SensorLearnedProfile(entity_id=str(seid))
+                self.sensor_profiles[seid].placement = str(splace)
+                self.sensor_profiles[seid].suggest_blacklist = False
+                self.sensor_profiles[seid].base_trust_weight = 1.0
         if CONF_EXCLUDED_ENTITIES in updates and isinstance(updates[CONF_EXCLUDED_ENTITIES], list):
             self.config[CONF_EXCLUDED_ENTITIES] = list(updates[CONF_EXCLUDED_ENTITIES])
             self.async_discover_area_entities()
@@ -2082,19 +2264,32 @@ class RoomController:
             for rkey, rval in updates[CONF_REGIME_CONFIGS].items():
                 if rkey in TIME_REGIMES and isinstance(rval, dict):
                     if "occupied_scene" in rval:
-                        self.regime_configs[rkey]["occupied_scene"] = str(rval["occupied_scene"])
+                        oscene = str(rval["occupied_scene"])
+                        if oscene.startswith("scene."):
+                            oscene = f"ha_{oscene.replace('scene.', '')}"
+                        self.regime_configs[rkey]["occupied_scene"] = oscene
+                        # Keep any matching presence_only trigger synchronized with occupied_scene
+                        for trig in self.scene_triggers:
+                            if trig.get("entity_id") in (None, "", "presence_only") and trig.get("regime") == rkey:
+                                trig["scene_id"] = oscene
                     if "off_scene" in rval:
-                        self.regime_configs[rkey]["off_scene"] = str(rval["off_scene"])
+                        fscene = str(rval["off_scene"])
+                        if fscene.startswith("scene."):
+                            fscene = f"ha_{fscene.replace('scene.', '')}"
+                        self.regime_configs[rkey]["off_scene"] = fscene
                     if "off_scene_when_unoccupied" in rval:
                         self.regime_configs[rkey]["off_scene_when_unoccupied"] = bool(rval["off_scene_when_unoccupied"])
                     if "off_scene_when_bright" in rval:
                         self.regime_configs[rkey]["off_scene_when_bright"] = bool(rval["off_scene_when_bright"])
                     if "turn_on_lux" in rval:
-                        self.regime_configs[rkey]["turn_on_lux"] = round(clamp(float(rval["turn_on_lux"]), 0.5, 200.0), 1)
+                        self.regime_configs[rkey]["turn_on_lux"] = round(clamp(float(rval["turn_on_lux"]), 0.5, 500.0), 1)
                     if "target_brightness_pct" in rval:
-                        self.regime_configs[rkey]["target_brightness_pct"] = int(clamp(round(float(rval["target_brightness_pct"])), 1, 100))
+                        new_tbri = int(clamp(round(float(rval["target_brightness_pct"])), 1, 100))
+                        self.regime_configs[rkey]["target_brightness_pct"] = new_tbri
+                        if new_tbri > 5 and "shed_count" not in rval:
+                            self.regime_configs[rkey]["shed_count"] = 0
                     if "target_total_lux" in rval:
-                        self.regime_configs[rkey]["target_total_lux"] = round(clamp(float(rval["target_total_lux"]), 1.0, 300.0), 1)
+                        self.regime_configs[rkey]["target_total_lux"] = round(clamp(float(rval["target_total_lux"]), 1.0, 500.0), 1)
                     if "shed_count" in rval:
                         self.regime_configs[rkey]["shed_count"] = int(max(0, int(rval["shed_count"])))
                     spec = self.learned_weights.get_regime_spec(rkey)

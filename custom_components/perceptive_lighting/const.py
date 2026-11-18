@@ -5,7 +5,7 @@ from typing import Final
 
 DOMAIN: Final = "perceptive_lighting"
 NAME: Final = "Perceptive Lighting"
-VERSION: Final = "2.0.3"
+VERSION: Final = "2.1.0"
 
 # Static frontend URL for bundled custom Lovelace cards & Sidebar Panel
 STATIC_URL_PATH: Final = "/perceptive_lighting_static"
@@ -49,11 +49,12 @@ CONF_LIGHT_GROUPS: Final = "light_groups"
 CONF_ACTIVITY_TRIGGERS: Final = "activity_triggers"
 CONF_BLOCKER_ENTITIES: Final = "blocker_entities"
 
-# v2.0.0 Room Configuration Keys
+# v2.0.0+ Room Configuration Keys
 CONF_LIGHT_PRIORITY_ORDER: Final = "light_priority_order"
 CONF_LIGHT_ORDER_LOCKED: Final = "light_order_locked"
 CONF_REGIME_CONFIGS: Final = "regime_configs"
 CONF_SCENE_TRIGGERS: Final = "scene_triggers"
+CONF_VACANCY_DELAY_SECONDS: Final = "vacancy_delay_seconds"
 
 # Operating Modes
 MODE_SENSOR_ONLY: Final = "sensor_only"
@@ -225,10 +226,12 @@ STATE_DIM: Final = "dim"
 STATE_COMFORTABLE: Final = "comfortable"
 STATE_BRIGHT: Final = "bright"
 
-# Default Anti-Flicker & Smoothing Constants
-DEFAULT_ON_OFF_COOLDOWN_MINUTES: Final = 10
-DEFAULT_ADJUST_INTERVAL_MINUTES: Final = 5
-DEFAULT_TRANSITION_SECONDS: Final = 15
+# Default Anti-Flicker, Smoothing & Vacancy Hold Constants
+DEFAULT_ON_OFF_COOLDOWN_MINUTES: Final = 3
+DEFAULT_ADJUST_INTERVAL_MINUTES: Final = 2
+DEFAULT_TRANSITION_SECONDS: Final = 12
+DEFAULT_VACANCY_DELAY_ADAPTIVE_SECONDS: Final = 90
+DEFAULT_VACANCY_DELAY_TRANSIT_SECONDS: Final = 30
 DEFAULT_SUBSTANTIAL_LUX_SHIFT_PCT: Final = 35.0
 DEFAULT_MICRO_NUDGE_STEP_PCT: Final = 15.0
 
@@ -274,7 +277,7 @@ DEFAULT_REGIME_SCHEDULE: Final = {
     "overnight_start_hour": 23.0,
     "overnight_end_hour": 6.0,
     "gloom_early_evening": True,
-    "gloom_sky_lux_threshold": 350.0,
+    "gloom_sky_lux_threshold": 1500.0,
     "transition_minutes": 45,
 }
 
