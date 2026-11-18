@@ -410,12 +410,13 @@ class RoomController:
         self._obs_since_last_gemini_call: int = 0
 
         # Adaptive scenes (linked HA scenes + user captured scenes)
+        is_v211_clean = bool(pstate.get("schema_v211_cleaned", False))
         self.adaptive_scenes: dict[str, AdaptiveSceneSpec] = {}
         for sid, sdata in pstate.get("adaptive_scenes", {}).items():
             if isinstance(sdata, dict):
                 spec = AdaptiveSceneSpec.from_dict(sdata)
-                if not is_v210_clean and spec.linked_ha_scene_entity:
-                    # Clear stale 0.8s mid-transition snapshots so linked HA scenes re-snapshot cleanly
+                if (not is_v210_clean or not is_v211_clean) and spec.linked_ha_scene_entity:
+                    # Clear snapshots that included duplicate Govee entities so linked HA scenes run cleanly
                     spec.light_states = {}
                 self.adaptive_scenes[sid] = spec
         for sid, sdata in room_config.get(CONF_ADAPTIVE_SCENES, {}).items():
@@ -446,6 +447,9 @@ class RoomController:
         self.active_trigger_id: str | None = None
         self._last_resolved_scene_id: str | None = None
         self._last_active_trigger_id: str | None = None
+        self._last_applied_scene_id: str | None = None
+        self._last_applied_bri_pct: int | None = None
+        self._last_applied_shed_count: int | None = None
         self.decision_reason: str = "Initializing..."
         self._recent_context_ids: set[str] = set()
         self._ignore_light_events_until_utc: datetime | None = None
@@ -478,6 +482,7 @@ class RoomController:
         return {
             "schema_v200_cleaned": True,
             "schema_v210_cleaned": True,
+            "schema_v211_cleaned": True,
             "automation_locked": self.automation_locked,
             CONF_OPERATING_MODE: self.operating_mode,
             CONF_CCT_MODE: self.config.get(CONF_CCT_MODE, CCT_EXTERNAL),
@@ -673,14 +678,34 @@ class RoomController:
                     continue
                 light_list.append(eid)
 
-        # Deduplicate Light Group wrapper entities if their member lights are in the Area
+        # Deduplicate Light Group wrapper entities and dual-integration hardware duplicates (e.g. Govee Cloud vs Govee2MQTT)
+        scene_referenced_lights: set[str] = set()
+        for entry in ent_reg.entities.values():
+            if entry.domain == "scene" and not entry.disabled_by:
+                in_area = entry.area_id == self.area_id or (
+                    entry.area_id is None and entry.device_id in area_device_ids
+                )
+                if in_area:
+                    sst = self.hass.states.get(entry.entity_id)
+                    smembers = sst.attributes.get("entity_id") if sst else None
+                    if isinstance(smembers, (list, tuple)):
+                        scene_referenced_lights.update(str(m) for m in smembers)
+
         light_set = set(light_list)
         deduped_lights: list[str] = []
+        hw_groups: dict[str, list[str]] = {}
+        duplicate_hw_lights: set[str] = set()
+
         for leid in light_list:
             l_entry = ent_reg.async_get(leid)
             if l_entry and l_entry.platform == "group" and len(light_list) > 1:
                 continue
             if leid.lower().startswith("light.all_lights_") and len(light_list) > 1:
+                continue
+            if leid.lower().endswith("_ceiling_flood_cloud") and any(
+                "ceiling_flood_switchbot" in x.lower() for x in light_list
+            ):
+                duplicate_hw_lights.add(leid)
                 continue
             lst = self.hass.states.get(leid)
             members = lst.attributes.get("entity_id") if lst else None
@@ -691,8 +716,33 @@ class RoomController:
             ):
                 continue
             deduped_lights.append(leid)
+            if l_entry and l_entry.unique_id:
+                norm_hw = (
+                    str(l_entry.unique_id)
+                    .lower()
+                    .replace("gv2mqtt-", "")
+                    .replace(":", "")
+                    .replace("-", "")
+                    .strip()
+                )
+                if len(norm_hw) >= 10:
+                    hw_groups.setdefault(norm_hw, []).append(leid)
+
+        for norm_hw, group_eids in hw_groups.items():
+            if len(group_eids) > 1:
+                # Prefer the entity referenced by room scenes, or the local MQTT entity over cloud
+                def _pref_score(e: str) -> tuple[int, int]:
+                    le = ent_reg.async_get(e)
+                    in_sc = 1 if e in scene_referenced_lights else 0
+                    is_mqtt = 1 if (le and le.platform == "mqtt") else 0
+                    return (in_sc, is_mqtt)
+
+                ranked = sorted(group_eids, key=_pref_score, reverse=True)
+                for dup_eid in ranked[1:]:
+                    duplicate_hw_lights.add(dup_eid)
+
         if deduped_lights:
-            light_list = deduped_lights
+            light_list = [e for e in deduped_lights if e not in duplicate_hw_lights]
 
         self.all_area_entities = {
             "illuminance_sensors": sorted(lux_list),
@@ -1281,6 +1331,9 @@ class RoomController:
             self.manual_override_baseline_natural_pct = None
             self.active_shed_count = 0
             self.shed_light_entities = []
+            self._last_applied_scene_id = None
+            self._last_applied_bri_pct = None
+            self._last_applied_shed_count = None
 
             if off_scene != "off" and rcfg.get("off_scene_when_unoccupied", False):
                 if not self.off_scene_currently_active or occupancy_just_changed:
@@ -1337,6 +1390,9 @@ class RoomController:
                     shed_count=rec_shed,
                     transition=2 if (occupancy_just_changed or force_apply) else 12,
                 )
+                self._last_applied_scene_id = scene_id
+                self._last_applied_bri_pct = max(1, rec_bri)
+                self._last_applied_shed_count = rec_shed
                 self.last_on_off_change_utc = now
                 self.last_adjustment_utc = now
         else:
@@ -1346,6 +1402,9 @@ class RoomController:
                     return
                 self.active_shed_count = 0
                 self.shed_light_entities = []
+                self._last_applied_scene_id = None
+                self._last_applied_bri_pct = None
+                self._last_applied_shed_count = None
                 if off_scene != "off" and rcfg.get("off_scene_when_bright", False):
                     await self._async_apply_scene_by_id(
                         off_scene,
@@ -1363,7 +1422,26 @@ class RoomController:
                 self.last_on_off_change_utc = now
                 return
 
-            # Lights stay ON -> Check 5-minute gradual adjustment interval (bypassed during active calibration/force_apply)
+            # Idempotency guard: if the active scene and shed count are already applied and
+            # either a device conditional rule is holding a native HA scene OR target brightness hasn't shifted by >= 4%,
+            # do not re-send redundant commands every 2 minutes!
+            if (
+                not force_apply
+                and self._last_applied_scene_id == scene_id
+                and self._last_applied_shed_count == rec_shed
+            ):
+                spec_check = self._get_or_create_scene_spec(scene_id)
+                if (
+                    (self.active_trigger_id is not None and spec_check and spec_check.linked_ha_scene_entity)
+                    or not scale_dyn
+                    or (
+                        self._last_applied_bri_pct is not None
+                        and abs(max(1, rec_bri) - self._last_applied_bri_pct) < 4
+                    )
+                ):
+                    return
+
+            # Lights stay ON -> Check gradual adjustment interval (bypassed during active calibration/force_apply)
             adjust_mins = float(
                 self.config.get(
                     CONF_ADJUST_INTERVAL_MINUTES, DEFAULT_ADJUST_INTERVAL_MINUTES
@@ -1388,6 +1466,9 @@ class RoomController:
                 shed_count=rec_shed,
                 transition=2 if force_apply else transition_sec,
             )
+            self._last_applied_scene_id = scene_id
+            self._last_applied_bri_pct = max(1, rec_bri)
+            self._last_applied_shed_count = rec_shed
             self.last_adjustment_utc = now
 
     def _compute_shed_split(
@@ -1507,6 +1588,42 @@ class RoomController:
         transition: int = 12,
     ) -> None:
         """Apply an Adaptive/HA Scene scaled dynamically to `target_brightness_pct` (1%..100%) and `shed_count`."""
+        # If linked to a native HA scene and triggered by a conditional device rule (e.g. TV playing -> Projector scene)
+        # or fixed-brightness mode with no shedding, activate the native HA scene directly so its exact saved colors/brightnesses apply!
+        if (
+            spec.linked_ha_scene_entity
+            and shed_count == 0
+            and (self.active_trigger_id is not None or not scale_dynamically)
+        ):
+            ctx = self._make_context()
+            self._ignore_light_events_until_utc = datetime.now(timezone.utc) + timedelta(
+                seconds=10.0
+            )
+            await self.hass.services.async_call(
+                "scene",
+                "turn_on",
+                {ATTR_ENTITY_ID: spec.linked_ha_scene_entity},
+                context=ctx,
+            )
+            # Turn off any room lights in `self.lights` that are NOT part of this HA scene
+            scene_st = self.hass.states.get(spec.linked_ha_scene_entity)
+            raw_members = scene_st.attributes.get("entity_id") if scene_st else None
+            if isinstance(raw_members, (list, tuple)) and raw_members:
+                member_set = set(str(m) for m in raw_members)
+                non_scene_on = [
+                    e
+                    for e in self.lights
+                    if e not in member_set
+                    and (st := self.hass.states.get(e))
+                    and st.state == STATE_ON
+                ]
+                if non_scene_on:
+                    await self._async_call_light_service(
+                        STATE_OFF, non_scene_on, {"transition": 2}
+                    )
+            self.controlled_lights_are_on = True
+            return
+
         # If linked to a native HA scene without captured per-light snapshot yet, activate & snapshot after settled
         if spec.linked_ha_scene_entity and not spec.light_states:
             ctx = self._make_context()
@@ -1518,7 +1635,6 @@ class RoomController:
                 "turn_on",
                 {
                     ATTR_ENTITY_ID: spec.linked_ha_scene_entity,
-                    "transition": 1,
                 },
                 context=ctx,
             )
@@ -1528,15 +1644,20 @@ class RoomController:
         if not spec.light_states:
             return
 
+        active_light_set = set(self.lights)
         scene_on_lights = [
             eid
             for eid, lstate in spec.light_states.items()
-            if eid not in self.excluded_entities and lstate.get("state") == STATE_ON
+            if eid in active_light_set
+            and eid not in self.excluded_entities
+            and lstate.get("state") == STATE_ON
         ]
         scene_off_lights = [
             eid
             for eid, lstate in spec.light_states.items()
-            if eid not in self.excluded_entities and lstate.get("state") == STATE_OFF
+            if eid in active_light_set
+            and eid not in self.excluded_entities
+            and lstate.get("state") == STATE_OFF
         ]
 
         to_keep, to_shed = self._compute_shed_split(
