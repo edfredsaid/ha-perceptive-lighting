@@ -677,6 +677,11 @@ class RoomController:
         light_set = set(light_list)
         deduped_lights: list[str] = []
         for leid in light_list:
+            l_entry = ent_reg.async_get(leid)
+            if l_entry and l_entry.platform == "group" and len(light_list) > 1:
+                continue
+            if leid.lower().startswith("light.all_lights_") and len(light_list) > 1:
+                continue
             lst = self.hass.states.get(leid)
             members = lst.attributes.get("entity_id") if lst else None
             if (
